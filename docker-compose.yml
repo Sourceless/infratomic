@@ -1,0 +1,16 @@
+services:
+  localstack:
+    image: localstack/localstack:3.8
+    container_name: infratomic-localstack
+    ports:
+      - "4566:4566" # LocalStack gateway (single-port edge)
+      - "4510-4559:4510-4559" # External service port range (used by some emulated services)
+    environment:
+      - SERVICES=s3,iam,lambda
+      - DEBUG=0
+    volumes:
+      - "localstack-data:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
+volumes:
+  localstack-data:
