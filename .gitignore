@@ -12,3 +12,8 @@ terraform/**/*.zip
 .direnv/
 result
 result-*
+
+# Clojure / Datomic local dev
+.datomic/
+.cpcache/
+target/
