@@ -86,15 +86,20 @@ than curl's `-d`/`--data`, which defaults to
 
 `state-backend/` is a Clojure service implementing Terraform's `http` state
 backend protocol (`GET`/`POST`/`DELETE` on `/state`; `LOCK`/`UNLOCK` are out
-of scope). It persists each `terraform apply`'s raw state JSON verbatim (so
-`GET` always returns exactly what Terraform last wrote) and, from the same
-POST, upserts one Datomic entity per Terraform-managed resource — bucket,
-IAM role, Lambda function, Lambda function URL — keyed by `(type, name)`,
-so infrastructure is queryable without parsing state JSON. Storage is
-Datomic dev-local, embedded in the service process (no separate
+of scope). No raw state JSON is ever stored — Datomic dev-local hard-limits
+`:db.type/string` datoms to 4096 bytes, well under the sample app's real
+state size — so each `terraform apply`'s `POST` is decomposed instead: a
+small `state-version` entity holds the state's top-level metadata (format
+version, Terraform version, serial, lineage, outputs), and one Datomic
+entity is upserted per Terraform-*managed* resource — bucket, IAM role,
+Lambda function, Lambda function URL — keyed by `(type, name)`, so
+infrastructure is queryable without parsing state JSON. `GET` reconstructs
+a Terraform-acceptable state JSON document from these entities on demand.
+Storage is Datomic dev-local, embedded in the service process (no separate
 transactor), persisted to a gitignored `.datomic/` directory at the repo
-root so state survives restarts. See `docs/adr/0001-dual-storage-in-state-backend.md`
-for why both representations are stored.
+root so state survives restarts. See
+`docs/adr/0002-reconstruct-state-instead-of-raw-storage.md` for why state
+is reconstructed rather than stored raw.
 
 ### Running it
 
