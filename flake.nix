@@ -10,7 +10,7 @@
     in
     {
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ pkgs.git pkgs.nix pkgs.clojure pkgs.jdk ];
+        packages = [ pkgs.git pkgs.nix pkgs.jdk17 pkgs.clojure ];
       };
     };
 }

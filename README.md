@@ -2,6 +2,57 @@
 
 The logic-powered infrastructure database
 
+## Local Datomic database
+
+`deps.edn` and `src/infratomic/datomic.clj` set up a local, file-backed
+Datomic database (via `com.datomic/local`) so app code can be built and
+tested without any shared or remote Datomic infrastructure (no Cloud,
+transactor, or license setup).
+
+### Bring up the database
+
+Enter the dev shell (provides a JDK 17+ runtime and the Clojure CLI) and
+run the verification test:
+
+```sh
+nix develop
+clj -M:test
+```
+
+There's no separate "bring up" step — `infratomic.datomic/connect`
+creates the local database on demand (idempotently) the first time it's
+called.
+
+Storage is repo-local rather than relying on `~/.datomic/local.edn`:
+data is persisted under `.datomic/storage` (an absolute path resolved
+from the process's working directory, gitignored), using the fixed
+dev-local system name `"dev"`. Both are defined in
+`src/infratomic/datomic.clj`. Delete `.datomic/storage` at any time to
+reset local state.
+
+### Verifying it worked
+
+```sh
+clj -M:test
+```
+
+This runs `test/infratomic/datomic_test.clj`, which connects to a local
+database, transacts a minimal inline fixture schema (a single
+`:sample/name` string attribute — throwaway test plumbing, not app
+schema design), transacts a sample fact, queries it back, and asserts
+the result matches. A clean `0 failures, 0 errors` (or equivalent) run
+from a fresh clone, with no manual setup beyond `nix develop` + `clj
+-M:test`, confirms the round-trip works.
+
+### Notes
+
+- No shared/remote Datomic storage (Cloud, transactor, license setup)
+  is in scope — this is purely a local, file-backed database for
+  development.
+- No app schema design is in scope; the fixture schema transacted by
+  the test exists only to exercise the connect/transact/query
+  round-trip.
+
 ## Local AWS test app (LocalStack + Terraform)
 
 `terraform/` provisions a small, real Lambda-backed upload app — an S3
