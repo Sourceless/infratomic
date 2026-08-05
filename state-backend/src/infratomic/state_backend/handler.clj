@@ -10,7 +10,10 @@
   Only `mode == \"managed\"` entries from the posted `resources[]` are
   persisted — Terraform always re-reads `mode == \"data\"` (data source)
   entries fresh on every plan/apply regardless of prior state, so omitting
-  them causes no drift (verified against the real sample app)."
+  them causes no drift (verified against the real sample app). `POST` also
+  retracts any resource entity whose `:resource/id` is not present in the
+  newly posted `resources[]` (e.g. a destroyed resource), so a resource
+  removed from state never lingers in subsequent `GET`s."
   (:require [cheshire.core :as json]
             [datomic.client.api :as d]
             [infratomic.state-backend.db :as db]))
@@ -34,17 +37,25 @@
     "private"              (get instance "private")
     "dependencies"         (get instance "dependencies")}))
 
+(defn- resource-id
+  [resource]
+  (str (get resource "type") "." (get resource "name")))
+
+(defn- managed-resources
+  "The *managed* entries (`mode == \"data\"` entries excluded) from a parsed
+  posted state's `resources[]`."
+  [parsed]
+  (filter managed? (get parsed "resources" [])))
+
 (defn- resource->tx
   "Build an upsert tx-map for one *managed* entry in the posted state's
   `resources[]`, referencing the new state-version via its tempid."
   [state-version-tempid resource]
-  (let [type       (get resource "type")
-        name       (get resource "name")
-        instance   (-> resource (get "instances") first)
+  (let [instance   (-> resource (get "instances") first)
         attributes (get instance "attributes" {})]
-    {:resource/id             (str type "." name)
-     :resource/type           type
-     :resource/name           name
+    {:resource/id             (resource-id resource)
+     :resource/type           (get resource "type")
+     :resource/name           (get resource "name")
      :resource/attributes     (json/generate-string attributes)
      :resource/instance-meta  (instance-meta resource instance)
      :resource/state-version  state-version-tempid}))
@@ -59,7 +70,7 @@
   identifiable by the presence of `:state-version/outputs`."
   [parsed]
   (let [sv-tempid  "new-state-version"
-        resources  (filter managed? (get parsed "resources" []))
+        resources  (managed-resources parsed)
         outputs    (get parsed "outputs" {})
         sv-tx      (cond-> {:db/id                 sv-tempid
                              :state-version/outputs (json/generate-string outputs)}
@@ -68,6 +79,18 @@
                      (contains? parsed "serial")            (assoc :state-version/serial (get parsed "serial"))
                      (contains? parsed "lineage")           (assoc :state-version/lineage (get parsed "lineage")))]
     (into [sv-tx] (map (partial resource->tx sv-tempid) resources))))
+
+(defn- stale-resource-retractions
+  "Tx-data retracting resource entities that are currently in `db` but are
+  no longer present in `parsed`'s managed `resources[]` - i.e. resources
+  destroyed or otherwise removed from Terraform's state since the last
+  `POST`. Without this, `GET`/`terraform state list` would keep serving
+  \"ghost\" resources indefinitely, since `resource->tx` only ever upserts."
+  [db parsed]
+  (let [posted-ids (into #{} (map resource-id) (managed-resources parsed))
+        existing   (db/resource-id->eid db)
+        stale-eids (vals (apply dissoc existing posted-ids))]
+    (mapv (fn [eid] [:db/retractEntity eid]) stale-eids)))
 
 (defn- parse-json
   "Parse `s` as JSON, returning ::invalid instead of throwing on failure."
@@ -133,8 +156,10 @@
       {:status  400
        :headers {"Content-Type" "application/json"}
        :body    (json/generate-string {:error "invalid JSON"})}
-      (do
-        (d/transact conn {:tx-data (post-tx-data parsed)})
+      (let [db          (d/db conn)
+            retractions (stale-resource-retractions db parsed)
+            tx-data     (into (post-tx-data parsed) retractions)]
+        (d/transact conn {:tx-data tx-data})
         {:status 200 :headers {} :body ""}))))
 
 (defn delete-state

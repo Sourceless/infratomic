@@ -8,8 +8,8 @@
   decomposed into a `state-version` entity (small top-level metadata only)
   and one `resource` entity per managed resource; `GET` reconstructs a state
   JSON document from these entities (see `infratomic.state-backend.handler`).
-  See docs/adr/0001-dual-storage-in-state-backend.md for the resource
-  attribute storage rationale."
+  See docs/adr/0002-reconstruct-state-instead-of-raw-storage.md for the
+  resource attribute storage rationale."
   (:require [datomic.client.api :as d]))
 
 (def db-name "state-backend")
@@ -108,6 +108,14 @@
   "All resource entity ids currently in the database."
   [db]
   (map first (d/q '[:find ?e :where [?e :resource/id]] db)))
+
+(defn resource-id->eid
+  "Map of `:resource/id` -> entity id for every resource entity currently in
+  the database. Used by `POST` to find resources that are in the database
+  but no longer present in the newly posted state (e.g. destroyed/removed
+  resources), so their stale entities can be retracted."
+  [db]
+  (into {} (d/q '[:find ?id ?e :where [?e :resource/id ?id]] db)))
 
 (defn all-resources
   "Pull `:resource/type`, `:resource/name`, `:resource/attributes`, and
