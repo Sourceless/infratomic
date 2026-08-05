@@ -1,5 +1,5 @@
 {
-  description = "Bare dev shell providing git and nix";
+  description = "Dev shell providing git, nix, and the Clojure toolchain for the State Backend";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

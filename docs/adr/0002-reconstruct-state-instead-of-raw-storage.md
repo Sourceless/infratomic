@@ -1,0 +1,13 @@
+# Reconstruct Terraform state from decomposed entities instead of storing it raw
+
+Supersedes [ADR-0001](0001-dual-storage-in-state-backend.md).
+
+ADR-0001 chose to store the raw `POST`ed state JSON verbatim (for `GET` fidelity) alongside decomposed `resource` entities (for querying). Implementing that design against the real sample app failed immediately: Datomic dev-local hard-enforces a 4096-byte limit per `:db.type/string` datom, with no configuration knob to raise it (confirmed by decompiling `com.datomic/local` 1.0.291's `datomic.dev-local.log-representation/enforce-tx-limits!`), and the sample app's real state document — S3 bucket, IAM role, Lambda function, Lambda function URL, with real AWS-provider-computed attributes — is ~12.4KB on the very first apply, about 3x over the limit. This isn't a future-scale concern; raw-blob storage as specced cannot satisfy the sample app's needs at all.
+
+We now store no raw state JSON anywhere. `POST` decomposes the posted state into a small `state-version` entity (format version, Terraform version, serial, lineage, outputs — all well under the byte limit) and one `resource` entity per **managed** resource (attributes plus an opaque instance-metadata blob: schema version, provider, sensitive attributes, private data, dependencies). `GET` reconstructs a Terraform-state-JSON document from these entities on the fly.
+
+This was validated empirically, not just asserted: applying the real sample app against the State Backend, restarting the service, and running `terraform plan` produces "No changes. Your infrastructure matches the configuration." Terraform's `http` backend client parses the `GET` response into Go structs rather than byte-diffing it against what it last posted, so a reconstructed-but-structurally-equivalent document is sufficient — ADR-0001's premise that fidelity required byte-for-byte storage was incorrect.
+
+Resources with `mode == "data"` (data sources) are deliberately excluded from persistence and reconstruction: Terraform always re-reads data sources fresh on every `plan`/`apply` regardless of what's in the prior state, so their absence causes no drift (also verified empirically against the sample app's two data sources).
+
+Trade-off accepted: the reconstructed document is not guaranteed identical to what Terraform would produce for arbitrarily complex configurations (e.g. `count`/`for_each` resources needing `index_key`, or a single resource's attributes exceeding 4096 bytes) — untested because the sample app doesn't exercise those cases. If the sample app grows to need them, this reconstruction will need extending, not just re-verifying.
