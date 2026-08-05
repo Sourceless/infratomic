@@ -18,11 +18,11 @@ The repo SHALL contain a `flake.nix` at its root that is a valid Nix flake.
 - **THEN** the command succeeds with no errors
 
 ### Requirement: Dev shell provides baseline toolchain
-The flake SHALL expose a `devShells.x86_64-linux.default` output that puts `git` and `nix` on `PATH`.
+The flake SHALL expose a `devShells.x86_64-linux.default` output that puts `git`, `nix`, a JDK 17+ runtime, and the Clojure CLI on `PATH`.
 
 #### Scenario: Entering the dev shell
 - **WHEN** a contributor runs `nix develop` from the repo root on an `x86_64-linux` system
-- **THEN** they enter a shell where `git --version` and `nix --version` both succeed
+- **THEN** they enter a shell where `git --version`, `nix --version`, `java -version` (reporting major version 17 or higher), and `clj --version` all succeed
 
 ### Requirement: Flake targets x86_64-linux only
 The flake's outputs SHALL be defined only for the `x86_64-linux` system; no other system SHALL be targeted.
@@ -31,12 +31,12 @@ The flake's outputs SHALL be defined only for the `x86_64-linux` system; no othe
 - **WHEN** a contributor inspects the flake's `devShells` output
 - **THEN** the only system key present is `x86_64-linux`
 
-### Requirement: No language-specific packages or CI in scope
-The dev shell SHALL contain only `git` and `nix`, with no language-specific toolchains, and the repo SHALL NOT gain a CI workflow as part of this capability.
+### Requirement: Dev shell package list is limited to baseline plus Clojure toolchain
+The dev shell SHALL contain only `git`, `nix`, a JDK 17+ package, and the Clojure CLI, with no other language-specific toolchains, and the repo SHALL NOT gain a CI workflow as part of this capability.
 
-#### Scenario: Dev shell package list is minimal
+#### Scenario: Dev shell package list is limited
 - **WHEN** a contributor inspects the packages passed to the dev shell derivation
-- **THEN** only `git` and `nix` are present, with no language-specific packages
+- **THEN** only `git`, `nix`, a JDK 17+ package, and the Clojure CLI package are present, with no other language-specific packages
 
 #### Scenario: No CI workflow is added
 - **WHEN** a contributor inspects the repository for CI configuration
