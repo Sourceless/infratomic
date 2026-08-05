@@ -1,33 +1,41 @@
 ## Purpose
 
-Implements Terraform's `http` state backend protocol as a Clojure service, persisting the sample app's Terraform state in an embedded Datomic database and exposing each managed resource as its own entity, so infrastructure can eventually be queried instead of parsed from raw state JSON.
+Implements Terraform's `http` state backend protocol as a Clojure service, decomposing the sample app's Terraform state into an embedded Datomic database — a state-version entity plus one entity per managed resource — and reconstructing a valid state JSON document from those entities on `GET`, so infrastructure can eventually be queried instead of parsed from raw state JSON. No raw state JSON is stored: Datomic dev-local's 4096-byte-per-string limit makes verbatim storage of the sample app's real state document (~12.4KB) impossible.
 
 ## ADDED Requirements
 
 ### Requirement: State Backend serves current state via GET
-The State Backend SHALL respond to `GET /state` with the raw JSON of the most recently posted Terraform state, verbatim, when state exists. When no state has ever been posted, it SHALL respond in a way Terraform's `http` backend client treats as "no state yet" (`204` or `404`).
+The State Backend SHALL respond to `GET /state` with a Terraform-state-JSON document reconstructed from the most recently posted state's decomposed entities, when state exists. The reconstructed document need not be byte-identical to what was last posted, but SHALL be a state document Terraform's `http` backend client accepts, reflecting the same top-level metadata (format version, Terraform version, serial, lineage, outputs) and the same managed resources with their attributes as most recently posted. When no state has ever been posted, it SHALL respond in a way Terraform's `http` backend client treats as "no state yet" (`204` or `404`).
 
 #### Scenario: Fetching state after at least one apply
 - **WHEN** a client sends `GET /state` and at least one state has previously been posted
-- **THEN** the response is `200` with a body identical to the most recently posted raw state JSON
+- **THEN** the response is `200` with a body that is a valid Terraform state JSON document reflecting the most recently posted top-level metadata and managed resources
 
 #### Scenario: Fetching state before any apply
 - **WHEN** a client sends `GET /state` and no state has ever been posted
 - **THEN** the response is `204` or `404`, and Terraform proceeds as if uninitialized
 
+#### Scenario: Reconstructed state round-trips without drift
+- **WHEN** a client applies Terraform against the State Backend, the service is restarted, and the client then runs `terraform plan`
+- **THEN** `terraform plan` reports no changes, confirming the state reconstructed via `GET` is equivalent to what was posted
+
 ### Requirement: State Backend persists posted state and derives resource entities
-The State Backend SHALL respond to `POST /state` by, in a single transaction, storing the posted JSON body verbatim as a new state version and upserting one resource entity per entry in the body's `resources[]` array, keyed by the resource's `(type, name)` pair. A resource entity SHALL carry the resource's type, name, raw attribute map, and a reference to the state version it was last seen in.
+The State Backend SHALL respond to `POST /state` by, in a single transaction, storing the posted document's top-level metadata (format version, Terraform version, serial, lineage, outputs) as a new state-version entity, and upserting one resource entity per **managed** entry in the body's `resources[]` array (`mode == "managed"`), keyed by the resource's `(type, name)` pair. A resource entity SHALL carry the resource's type, name, raw attribute map, enough additional structural metadata to reconstruct a Terraform-acceptable state document, and a reference to the state version it was last seen in. Entries in `resources[]` with `mode == "data"` (data sources) SHALL NOT be persisted as resource entities, since Terraform always re-reads data sources fresh on every `plan`/`apply` regardless of prior state.
 
 #### Scenario: Posting state for the first time
-- **WHEN** a client sends `POST /state` with a valid Terraform state JSON body containing one or more resources
-- **THEN** the backend persists the raw body verbatim as the current state version, and one resource entity exists per entry in `resources[]`, each with the correct type, name, and attribute map
+- **WHEN** a client sends `POST /state` with a valid Terraform state JSON body containing one or more managed resources
+- **THEN** the backend persists the state's top-level metadata as the current state version, and one resource entity exists per **managed** entry in `resources[]`, each with the correct type, name, and attribute map
 
 #### Scenario: Posting state again for an existing resource
 - **WHEN** a client sends `POST /state` and a resource in the body has the same `(type, name)` as a resource entity from a prior post
 - **THEN** the existing resource entity's attributes and state-version reference are updated in place, rather than a duplicate entity being created
 
+#### Scenario: Posting state with data-source entries
+- **WHEN** a client sends `POST /state` with a body whose `resources[]` includes entries with `mode == "data"`
+- **THEN** no resource entity is created or updated for those entries, while managed entries are persisted normally
+
 ### Requirement: State Backend purges state via DELETE
-The State Backend SHALL respond to `DELETE /state` by retracting the current raw state and all resource entities, and SHALL respond `200`.
+The State Backend SHALL respond to `DELETE /state` by retracting the current state-version entity and all resource entities, and SHALL respond `200`.
 
 #### Scenario: Deleting state
 - **WHEN** a client sends `DELETE /state` while state exists
@@ -49,7 +57,7 @@ The State Backend SHALL retain previously posted state and resource entities acr
 
 #### Scenario: Restarting the service
 - **WHEN** the State Backend process is stopped and restarted after state has been posted
-- **THEN** a subsequent `GET /state` returns the same raw state that was posted before the restart
+- **THEN** a subsequent `GET /state` returns a reconstructed state document reflecting the same top-level metadata and managed resources that were posted before the restart
 
 ### Requirement: Sample app's Terraform configuration uses the State Backend
 The sample app's Terraform configuration under `terraform/` SHALL be configured with an `http` backend pointing at the State Backend, so `terraform apply` reads and writes state exclusively through the service rather than a local state file.

@@ -5,9 +5,10 @@ The sample app's Terraform state currently lives in a local `terraform.tfstate` 
 ## What Changes
 
 - Add a new Clojure service, the **State Backend** (`state-backend/`), implementing Terraform's `http` backend protocol: `GET`, `POST`, and `DELETE` on `/state` at `http://localhost:8080` (`LOCK`/`UNLOCK` and auth remain out of scope).
-- On `POST`, in a single Datomic transaction: persist the raw state JSON verbatim as a new `state-version` entity (`:state-version/raw`, `:state-version/serial`, `:state-version/lineage`), and upsert one `resource` entity per entry in `resources[]` (`:resource/id`, `:resource/type`, `:resource/name`, `:resource/attributes`, `:resource/state-version` ref), keyed by `(type, name)`.
-- On `GET`, serve the latest `state-version`'s raw JSON verbatim (never reconstructed from resource entities); `204`/`404` semantics for "no state yet" per the `http` backend protocol.
-- On `DELETE`, retract the latest raw-state blob and all resource entities, returning `200`.
+- **No raw Terraform state JSON is ever stored.** Datomic dev-local hard-enforces a 4096-byte limit per `:db.type/string` datom; the sample app's real state document (~12.4KB) exceeds that on the very first apply, so storing it verbatim (as originally specced) is impossible, not a future-scale concern. State is decomposed and stored entity-by-entity instead.
+- On `POST`, in a single Datomic transaction: create a new `state-version` entity holding the state document's top-level metadata (`:state-version/version`, `:state-version/terraform-version`, `:state-version/serial`, `:state-version/lineage`, `:state-version/outputs`), and upsert one `resource` entity per **managed** (`mode == "managed"`) entry in `resources[]` (`:resource/id`, `:resource/type`, `:resource/name`, `:resource/attributes`, `:resource/instance-meta`, `:resource/state-version` ref), keyed by `(type, name)`. Entries with `mode == "data"` (data sources) are not persisted — Terraform always re-reads data sources fresh on every `plan`/`apply` regardless of what's in state, so omitting them from storage doesn't affect drift detection (confirmed empirically).
+- On `GET`, reconstruct a Terraform-state-JSON document on the fly from the latest `state-version` entity plus the current `resource` entities, and serve it as the response body; `204`/`404` semantics for "no state yet" per the `http` backend protocol. The reconstructed document does not need to be byte-identical to what was last POSTed — Terraform parses JSON structurally, so field order/formatting differences don't cause drift (confirmed empirically against the real sample app via `terraform plan`).
+- On `DELETE`, retract the latest `state-version` entity and all resource entities, returning `200`.
 - Malformed (non-JSON) `POST` bodies return `400`; valid JSON missing `resources`/`serial`/`lineage` is stored permissively (defaults: zero resources, `nil` serial/lineage).
 - Persist Datomic data via dev-local's `:storage-dir` pointed at a new gitignored `.datomic/` directory at the repo root, so state survives service restarts.
 - Run the service as a plain JVM process (`clojure -M -m infratomic.state-backend.main`), not containerized — Datomic Local is single-process/embedded and doesn't fit `docker-compose.yml`'s container model.
@@ -17,7 +18,7 @@ The sample app's Terraform state currently lives in a local `terraform.tfstate` 
 ## Capabilities
 
 ### New Capabilities
-- `state-backend`: A Clojure service implementing Terraform's `http` state backend protocol (GET/POST/DELETE), persisting raw state and per-resource entities in an embedded Datomic dev-local database.
+- `state-backend`: A Clojure service implementing Terraform's `http` state backend protocol (GET/POST/DELETE), decomposing state into a state-version entity and per-resource entities in an embedded Datomic dev-local database, and reconstructing a valid state JSON document from those entities on `GET`.
 
 ### Modified Capabilities
 - `nix-dev-shell`: The dev shell's "no language-specific packages" requirement is superseded — `clojure` and `jdk` are added as an explicit, scoped exception for the state backend's toolchain needs.
