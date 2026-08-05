@@ -11,6 +11,16 @@ terraform {
       version = "~> 2.4"
     }
   }
+
+  # State is stored in the State Backend (state-backend/), a Clojure service
+  # implementing Terraform's `http` backend protocol and persisting state in
+  # Datomic. LOCK/UNLOCK are out of scope, so `lock_address`/`unlock_address`
+  # are intentionally omitted. Start the service (`clojure -M -m
+  # infratomic.state-backend.main` from `state-backend/` inside `nix
+  # develop`) before running `terraform init`/`terraform apply`.
+  backend "http" {
+    address = "http://localhost:8080/state"
+  }
 }
 
 # Configured to target the LocalStack gateway instead of real AWS: dummy

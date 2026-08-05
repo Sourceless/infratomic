@@ -9,10 +9,19 @@ bucket, a minimal IAM execution role, and a Lambda function exposed via a
 Lambda Function URL — against a local AWS simulator, so infra changes can
 be exercised without any real AWS account or credentials.
 
+Terraform state for this stack is stored in Datomic via the **State
+Backend** (`state-backend/`) rather than a local `terraform.tfstate` file —
+see [State Backend](#state-backend-terraform-state-in-datomic) below.
+
 ### Bring up the stack
 
 ```sh
 docker compose up -d          # start LocalStack (gateway on localhost:4566)
+
+# in a separate terminal, inside nix develop:
+cd state-backend
+clojure -M -m infratomic.state-backend.main   # State Backend on localhost:8080
+
 cd terraform
 terraform init
 terraform apply
@@ -72,3 +81,46 @@ than curl's `-d`/`--data`, which defaults to
 - Out of scope for this stack: real AWS deployment, CI integration, and AWS
   services beyond S3 and the minimal Lambda + IAM role (no DynamoDB,
   ECS/EKS/Batch, or API Gateway).
+
+## State Backend (Terraform state in Datomic)
+
+`state-backend/` is a Clojure service implementing Terraform's `http` state
+backend protocol (`GET`/`POST`/`DELETE` on `/state`; `LOCK`/`UNLOCK` are out
+of scope). It persists each `terraform apply`'s raw state JSON verbatim (so
+`GET` always returns exactly what Terraform last wrote) and, from the same
+POST, upserts one Datomic entity per Terraform-managed resource — bucket,
+IAM role, Lambda function, Lambda function URL — keyed by `(type, name)`,
+so infrastructure is queryable without parsing state JSON. Storage is
+Datomic dev-local, embedded in the service process (no separate
+transactor), persisted to a gitignored `.datomic/` directory at the repo
+root so state survives restarts. See `docs/adr/0001-dual-storage-in-state-backend.md`
+for why both representations are stored.
+
+### Running it
+
+From inside `nix develop` (provides the `clojure` CLI and a JDK):
+
+```sh
+cd state-backend
+clojure -M -m infratomic.state-backend.main
+```
+
+This starts the service on `http://localhost:8080`, creating the Datomic
+database and schema on first run if they don't already exist.
+
+### Switching `terraform/` onto the State Backend
+
+`terraform/provider.tf` already points the `http` backend at
+`http://localhost:8080/state`. With the State Backend running:
+
+- **Fresh checkout / disposable local state (the common case for this
+  sample app):** delete any existing `terraform/terraform.tfstate` and run
+  `terraform init` as normal — Terraform initializes straight against the
+  `http` backend with no local state to migrate.
+- **If you have existing local state you want to keep:** run
+  `terraform init -migrate-state` instead. Terraform will detect the
+  backend change and prompt to copy the existing local state into the
+  State Backend on `POST /state`.
+
+This is a one-time step per checkout; subsequent `terraform apply` runs
+read and write state exclusively through the service.
