@@ -1,3 +1,5 @@
+**Superseded by [ADR-0003](0003-decompose-resource-attributes-into-datoms.md):** this ADR still stored each resource's attributes as one opaque JSON-encoded string, which made everything beyond `:resource/type`/`:resource/id` unqueryable via real Datalog. ADR-0003 decomposes attributes into typed/generic datoms instead. Kept here as a historical record of the original reasoning and why it turned out to be insufficient.
+
 # Reconstruct Terraform state from decomposed entities instead of storing it raw
 
 Supersedes [ADR-0001](0001-dual-storage-in-state-backend.md).

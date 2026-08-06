@@ -6,7 +6,7 @@ services:
       - "4566:4566" # LocalStack gateway (single-port edge)
       - "4510-4559:4510-4559" # External service port range (used by some emulated services)
     environment:
-      - SERVICES=s3,iam,lambda
+      - SERVICES=s3,iam,lambda,ec2
       - DEBUG=0
     volumes:
       - "localstack-data:/var/lib/localstack"
