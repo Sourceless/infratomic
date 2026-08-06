@@ -4,7 +4,7 @@
 - [x] 1.2 Add an `ec2` endpoint override to `terraform/provider.tf`'s `endpoints {}` block
 - [x] 1.3 Add `terraform/security_groups.tf` with an `aws_security_group` + `aws_security_group_rule` permitting ingress on port 22 from `0.0.0.0/0`
 - [x] 1.4 Add at least one more `aws_security_group` (+ rule(s) as needed) in the same file with no rule opening port 22 to `0.0.0.0/0`
-- [ ] 1.5 Manually verify: `docker compose up -d`, `terraform apply` succeeds and provisions both security groups against LocalStack
+- [x] 1.5 Manually verify: `docker compose up -d`, `terraform apply` succeeds and provisions both security groups against LocalStack
 
 ## 2. ADR
 
@@ -35,13 +35,13 @@
 
 ## 5. Integration test
 
-- [ ] 5.1 Add `state-backend/test/infratomic/state_backend/query_integration_test.clj`: setup (destroy any pre-existing `terraform/` state), `terraform apply -auto-approve`, run all 4 query functions against the live state-backend db, assert per the issue's acceptance criteria, teardown (`terraform destroy -auto-approve`) in a `finally`
-- [ ] 5.2 Add the new namespace to `test_runner.clj`'s namespace list (or a parallel integration-test runner, per design.md)
-- [ ] 5.3 Add a `:integration-test` `:exec-fn`-style alias to `state-backend/deps.edn` that runs only the integration test namespace, kept separate from the default `:test` alias
-- [ ] 5.4 Update README/issue verify instructions to reference the correct alias (`clojure -X:integration-test` or equivalent) instead of the issue's `clojure -M:test`, per the alignment decision
+- [x] 5.1 Add `state-backend/test/infratomic/state_backend/query_integration_test.clj`: setup (destroy any pre-existing `terraform/` state), `terraform apply -auto-approve`, run all 4 query functions against the live state-backend db, assert per the issue's acceptance criteria, teardown (`terraform destroy -auto-approve`) in a `finally`
+- [x] 5.2 Add the new namespace to `test_runner.clj`'s namespace list (or a parallel integration-test runner, per design.md)
+- [x] 5.3 Add a `:integration-test` `:exec-fn`-style alias to `state-backend/deps.edn` that runs only the integration test namespace, kept separate from the default `:test` alias
+- [x] 5.4 Update README/issue verify instructions to reference the correct alias (`clojure -X:integration-test` or equivalent) instead of the issue's `clojure -M:test`, per the alignment decision
 
 ## 6. Documentation and cleanup
 
-- [ ] 6.1 Update `db.clj`/`handler.clj` namespace docstrings that describe attributes as "one opaque JSON-encoded string" (now stale) to reflect decomposed storage
-- [ ] 6.2 Note in README (or a local dev note) that developers should delete `.datomic/` (or `DELETE /state`) before first running the app against this change, per design.md's Migration Plan
-- [ ] 6.3 Run `openspec validate issue-11-prove-datomic-state-store-answers-real-infra-queries --strict` and fix any issues
+- [x] 6.1 Update `db.clj`/`handler.clj` namespace docstrings that describe attributes as "one opaque JSON-encoded string" (now stale) to reflect decomposed storage
+- [x] 6.2 Note in README (or a local dev note) that developers should delete `.datomic/` (or `DELETE /state`) before first running the app against this change, per design.md's Migration Plan
+- [x] 6.3 Run `openspec validate issue-11-prove-datomic-state-store-answers-real-infra-queries --strict` and fix any issues
