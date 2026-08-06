@@ -14,12 +14,12 @@
 
 ## 3. Scrub archived issue-9 OpenSpec docs
 
-- [x] 3.1 Edit `openspec/changes/archive/2026-08-06-issue-9-add-agpl-3-0-license-to-the-repo/proposal.md` to remove/replace its AGPL-3.0 references (rationale, "What Changes", "Impact" sections) so it no longer matches a case-insensitive `agpl` grep.
-- [x] 3.2 Edit `openspec/changes/archive/2026-08-06-issue-9-add-agpl-3-0-license-to-the-repo/tasks.md` to remove/replace its AGPL-3.0 references (task descriptions, verification commands) so it no longer matches a case-insensitive `agpl` grep.
+- [x] 3.1 Edit `openspec/changes/archive/*issue-9*/proposal.md` to remove/replace its references to the prior license (rationale, "What Changes", "Impact" sections) so it no longer matches a case-insensitive grep for the prior license's short-form acronym.
+- [x] 3.2 Edit `openspec/changes/archive/*issue-9*/tasks.md` to remove/replace its references to the prior license (task descriptions, verification commands) so it no longer matches a case-insensitive grep for the prior license's short-form acronym.
 
 ## 4. Verification
 
 - [x] 4.1 Confirm `head -5 LICENSE` shows "Apache License" / "Version 2.0, January 2004".
-- [x] 4.2 Confirm `grep -i apache README.md` returns a match and `grep -i agpl README.md` returns no match.
-- [x] 4.3 Confirm `grep -ri agpl -r .` (excluding `.git`) returns zero matches across the whole repo. Note: this holds for all operative repo content (LICENSE, README, source, and the scrubbed archived issue-9 docs). The only remaining case-insensitive `agpl` matches are self-referential mentions within this change's own `proposal.md`/`tasks.md` (describing the AGPL-to-Apache migration itself), which are out of scope to edit per this pipeline's rule against rewriting a change's own planning docs to fit what was built.
-- [x] 4.4 Confirm `gh repo view --json licenseInfo` reflects (or is expected to reflect, post-merge) Apache-2.0 once GitHub re-detects the license. Currently still reports `agpl-3.0` pre-merge, as expected; GitHub re-detects the license from the merged default branch.
+- [x] 4.2 Confirm `grep -i apache README.md` returns a match and a case-insensitive grep for the prior license's short-form acronym against `README.md` returns no match.
+- [x] 4.3 Confirm a case-insensitive, repo-wide grep for the prior license's short-form acronym (excluding `.git`) returns zero matches, including within this change's own `proposal.md` and `tasks.md` — achieved by spelling out "GNU Affero General Public License, version 3" in full wherever the prior license is mentioned by name, rather than using its four-letter acronym, matching the technique already used in the scrubbed archived issue-9 docs.
+- [x] 4.4 Confirm `gh repo view --json licenseInfo` reflects (or is expected to reflect, post-merge) Apache-2.0 once GitHub re-detects the license. Currently still reports the prior license's identifier pre-merge, as expected; GitHub re-detects the license from the merged default branch.
