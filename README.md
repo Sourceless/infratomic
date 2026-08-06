@@ -183,4 +183,4 @@ read and write state exclusively through the service.
 
 ## License
 
-infratomic is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
+infratomic is licensed under the [Apache License 2.0](LICENSE).
