@@ -180,3 +180,7 @@ database and schema on first run if they don't already exist.
 
 This is a one-time step per checkout; subsequent `terraform apply` runs
 read and write state exclusively through the service.
+
+## License
+
+infratomic is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
