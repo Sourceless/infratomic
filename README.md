@@ -143,14 +143,25 @@ state size — so each `terraform apply`'s `POST` is decomposed instead: a
 small `state-version` entity holds the state's top-level metadata (format
 version, Terraform version, serial, lineage, outputs), and one Datomic
 entity is upserted per Terraform-*managed* resource — bucket, IAM role,
-Lambda function, Lambda function URL — keyed by `(type, name)`, so
-infrastructure is queryable without parsing state JSON. `GET` reconstructs
-a Terraform-acceptable state JSON document from these entities on demand.
-Storage is Datomic dev-local, embedded in the service process (no separate
-transactor), persisted to a gitignored `.datomic/` directory at the repo
-root so state survives restarts. See
-`docs/adr/0002-reconstruct-state-instead-of-raw-storage.md` for why state
-is reconstructed rather than stored raw.
+Lambda function, Lambda function URL, security groups and rules — keyed by
+`(type, name)`. Each resource's *attributes* are themselves decomposed into
+real Datomic datoms rather than one opaque JSON string: attributes declared
+in a data-driven schema map (`aws_security_group`/`aws_security_group_rule`
+today) are typed, structural attributes directly queryable via Datalog;
+every other attribute is a generic, still-real, exact-match-searchable
+key/value datom. `GET` reconstructs a Terraform-acceptable state JSON
+document from these entities on demand. Storage is Datomic dev-local,
+embedded in the service process (no separate transactor), persisted to a
+gitignored `.datomic/` directory at the repo root so state survives
+restarts. See `docs/adr/0003-decompose-resource-attributes-into-datoms.md`
+for why attributes are decomposed into datoms (superseding
+`docs/adr/0002-reconstruct-state-instead-of-raw-storage.md`).
+
+If you have an existing local `.datomic/` directory from before this
+change, delete it (or `DELETE /state` against a running service, then
+re-`apply`) before first running against this change — the new schema
+changes what's written and expected on read, and there's no migration
+tooling for old dev-local data (see the ADR's Migration Plan).
 
 ### Running it
 
@@ -180,6 +191,52 @@ database and schema on first run if they don't already exist.
 
 This is a one-time step per checkout; subsequent `terraform apply` runs
 read and write state exclusively through the service.
+
+### Querying deployed infrastructure
+
+`state-backend/src/infratomic/state_backend/query.clj` provides 4 functions
+proving that decomposed attributes answer real infrastructure questions as
+structural Datalog queries rather than JSON-blob scans: all deployed
+resources, resources by type, resources by attribute value (unified across
+generic and modeled/typed storage), and security groups with port 22 open
+to the internet (a join from `aws_security_group_rule`'s typed port/CIDR
+attributes back to its owning `aws_security_group`). These are functions
+only — called from tests, with no HTTP surface — see
+`state-backend/test/infratomic/state_backend/query_test.clj` for usage
+examples against an in-memory db.
+
+### Running the tests
+
+From inside `nix develop`, in `state-backend/`:
+
+```sh
+clojure -X:test
+```
+
+Runs the hermetic test suite (`handler_test.clj`, `query_test.clj`)
+against an in-memory Datomic dev-local database — no LocalStack or running
+service required. A clean `0 failures, 0 errors` confirms the `POST`/`GET`
+round-trip (including attribute decomposition/reconstruction) and all 4
+query functions behave correctly.
+
+There's also an integration test that exercises the real path end to end —
+`terraform apply` against real LocalStack, real Datomic dev-local storage,
+and the query functions run against that live db:
+
+```sh
+docker compose up -d   # from the repo root; ec2 must be enabled
+cd state-backend
+clojure -X:integration-test
+```
+
+This starts its own State Backend HTTP server for the test's duration
+(Datomic dev-local only allows one process to hold an open connection to a
+database at a time, so make sure no other `clojure -M -m
+infratomic.state-backend.main` process is already running against the
+same `.datomic/` storage before running this). It applies the sample app,
+asserts on all 4 query functions' results, then destroys the sample app's
+resources again — safe to run repeatedly without polluting shared local
+dev state.
 
 ## License
 

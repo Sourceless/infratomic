@@ -5,4 +5,6 @@
         ring/ring-jetty-adapter {:mvn/version "1.15.5"}
         cheshire/cheshire {:mvn/version "6.2.0"}}
  :aliases {:test {:extra-paths ["test"]
-                   :exec-fn    infratomic.state-backend.test-runner/run-tests}}}
+                   :exec-fn    infratomic.state-backend.test-runner/run-tests}
+           :integration-test {:extra-paths ["test"]
+                               :exec-fn    infratomic.state-backend.test-runner/run-integration-tests}}}

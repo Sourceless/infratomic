@@ -1,10 +1,4 @@
-# local-aws-environment Specification
-
-## Purpose
-
-Provides a local, no-credentials-required simulation of AWS (via LocalStack Community edition) that Terraform can target, so infrastructure changes can be provisioned and tested without a real AWS account.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: LocalStack starts via docker-compose
 A `docker-compose.yml` file SHALL exist at the repository root that starts a LocalStack Community edition container exposing the single-port gateway on `localhost:4566`, with the `ec2` service enabled alongside the existing services so `aws_security_group`/`aws_security_group_rule` resources can be provisioned.

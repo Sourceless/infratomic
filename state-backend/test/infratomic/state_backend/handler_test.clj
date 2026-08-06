@@ -98,3 +98,94 @@
     (handler/post-state conn (state-body [(resource "aws_s3_bucket" "uploads")]))
     (is (= 400 (:status (handler/post-state conn "not json"))))
     (is (= #{"aws_s3_bucket.uploads"} (resource-ids (handler/get-state conn))))))
+
+(defn- attributes-of
+  "The `attributes` map of the single resource named `name` in a `GET
+  /state` response body."
+  [get-response name]
+  (->> get-response
+       :body
+       json/parse-string
+       (#(get % "resources"))
+       (filter #(= name (get % "name")))
+       first
+       (#(get-in % ["instances" 0 "attributes"]))))
+
+(deftest modeled-attributes-round-trip
+  (testing "aws_security_group/aws_security_group_rule's modeled attributes survive POST/GET, typed and joinable"
+    (let [conn (fresh-conn)]
+      (handler/post-state
+       conn
+       (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-123"})
+                    (resource "aws_security_group_rule" "ssh_open_ingress"
+                              {"from_port"         22
+                               "to_port"            22
+                               "protocol"           "tcp"
+                               "security_group_id"  "sg-123"
+                               "cidr_blocks"        ["0.0.0.0/0"]})]))
+      (let [get-resp (handler/get-state conn)]
+        (is (= {"id" "sg-123"} (attributes-of get-resp "ssh_open")))
+        (is (= {"from_port"         22
+                "to_port"            22
+                "protocol"           "tcp"
+                "security_group_id"  "sg-123"
+                "cidr_blocks"        ["0.0.0.0/0"]}
+               (attributes-of get-resp "ssh_open_ingress")))))))
+
+(deftest unmodeled-attributes-round-trip-including-nested-values-and-types
+  (testing "an unmodeled resource type's attributes - scalars, nested maps/vectors, and value types - round-trip"
+    (let [conn (fresh-conn)]
+      (handler/post-state
+       conn
+       (state-body [(resource "aws_s3_bucket" "uploads"
+                               {"bucket"        "infratomic-test-app-uploads"
+                                "force_destroy" true
+                                "tags"          {"Environment" "dev"}
+                                "versions"      ["v1" "v2"]
+                                "unset"         nil})]))
+      (is (= {"bucket"        "infratomic-test-app-uploads"
+              "force_destroy" true
+              "tags"          {"Environment" "dev"}
+              "versions"      ["v1" "v2"]}
+             (attributes-of (handler/get-state conn) "uploads"))))))
+
+(deftest upsert-in-place-replaces-attributes-not-merges-them
+  (testing "modeled cardinality-many and generic attributes are replaced wholesale on a subsequent POST, not accumulated"
+    (let [conn (fresh-conn)]
+      (handler/post-state
+       conn
+       (state-body [(resource "aws_security_group_rule" "rule"
+                               {"from_port"         22
+                                "to_port"            22
+                                "protocol"           "tcp"
+                                "security_group_id"  "sg-123"
+                                "cidr_blocks"        ["10.0.0.0/16" "10.0.1.0/16"]})
+                    (resource "aws_s3_bucket" "uploads" {"tags" {"Environment" "dev"}})]))
+      (handler/post-state
+       conn
+       (state-body [(resource "aws_security_group_rule" "rule"
+                               {"from_port"         443
+                                "to_port"            443
+                                "protocol"           "tcp"
+                                "security_group_id"  "sg-123"
+                                "cidr_blocks"        ["0.0.0.0/0"]})
+                    (resource "aws_s3_bucket" "uploads" {"tags" {"Owner" "team-a"}})]))
+      (let [get-resp (handler/get-state conn)]
+        (is (= {"from_port"         443
+                "to_port"            443
+                "protocol"           "tcp"
+                "security_group_id"  "sg-123"
+                "cidr_blocks"        ["0.0.0.0/0"]}
+               (attributes-of get-resp "rule")))
+        (is (= {"tags" {"Owner" "team-a"}}
+               (attributes-of get-resp "uploads")))))))
+
+(deftest oversized-attribute-value-does-not-block-persisting-the-resource
+  (testing "one attribute value over the 4096-byte limit falls back to opaque storage without failing the transaction or affecting other attributes"
+    (let [conn  (fresh-conn)
+          huge  (apply str (repeat 5000 "x"))]
+      (handler/post-state
+       conn
+       (state-body [(resource "aws_s3_bucket" "uploads" {"bucket" "small" "policy" huge})]))
+      (is (= {"bucket" "small" "policy" huge}
+             (attributes-of (handler/get-state conn) "uploads"))))))
