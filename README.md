@@ -237,3 +237,7 @@ same `.datomic/` storage before running this). It applies the sample app,
 asserts on all 4 query functions' results, then destroys the sample app's
 resources again — safe to run repeatedly without polluting shared local
 dev state.
+
+## License
+
+infratomic is licensed under the [Apache License 2.0](LICENSE).
