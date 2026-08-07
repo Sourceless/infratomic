@@ -39,3 +39,7 @@ _Avoid_: error, failure, violation message
 **Address Stand-in**:
 When a Policy Check evaluates a not-yet-applied Resource, its AWS-assigned identifying attributes (e.g. `aws_security_group.id`) don't exist yet. The plan-decomposition glue code substitutes the Resource's own Terraform address instead (and resolves a direct single-reference symbolic dependency to the referenced Resource's address too), so an identity-based Rule join still matches. Only ever appears in a speculative db — never leaks into a real, applied Resource entity.
 _Avoid_: synthetic id, placeholder id, fake id
+
+**Workload**:
+An `aws_instance` resource placed in the sample app's network graph (VPC, subnet, security groups) — the endpoint kind `reachable?` traverses between when answering network reachability questions. Distinct from "the service", which refers to the State Backend itself.
+_Avoid_: service, node, host
