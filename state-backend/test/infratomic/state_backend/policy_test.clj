@@ -130,6 +130,37 @@
   (let [conn (fresh-conn)]
     (is (= 400 (:status (policy/policy-check conn "not json"))))))
 
+(deftest plan-with-null-to-port-does-not-crash
+  (testing "to_port null at plan time (e.g. computed from a not-yet-known value) decomposes normally
+  instead of getting an Address Stand-in substituted into its :db.type/long attribute - no datom for
+  it, so the rule's join has nothing to match and reports no violation, degrading to today's behavior
+  rather than throwing"
+    (let [conn (fresh-conn)
+          plan (plan-doc
+                [(planned-resource "aws_security_group" "ssh_open" {"id" nil})
+                 (planned-resource "aws_security_group_rule" "ssh_open_ingress"
+                                   {"from_port" 22 "to_port" nil "protocol" "tcp"
+                                    "security_group_id" nil "cidr_blocks" ["0.0.0.0/0"]})]
+                [(config-resource "aws_security_group" "ssh_open")
+                 (config-resource "aws_security_group_rule" "ssh_open_ingress"
+                                   (security-group-id-ref "aws_security_group.ssh_open"))])]
+      (is (empty? (policy/evaluate conn plan))))))
+
+(deftest plan-with-null-cidr-blocks-does-not-crash
+  (testing "cidr_blocks null at plan time decomposes normally instead of getting an Address Stand-in
+  substituted into its cardinality-many :db.type/string attribute (which would otherwise be iterated
+  character-by-character and rejected by Datomic) - no datom for it, so no violation is reported"
+    (let [conn (fresh-conn)
+          plan (plan-doc
+                [(planned-resource "aws_security_group" "ssh_open" {"id" nil})
+                 (planned-resource "aws_security_group_rule" "ssh_open_ingress"
+                                   {"from_port" 22 "to_port" 22 "protocol" "tcp"
+                                    "security_group_id" nil "cidr_blocks" nil})]
+                [(config-resource "aws_security_group" "ssh_open")
+                 (config-resource "aws_security_group_rule" "ssh_open_ingress"
+                                   (security-group-id-ref "aws_security_group.ssh_open"))])]
+      (is (empty? (policy/evaluate conn plan))))))
+
 (defn- resource
   ([type name] (resource type name {}))
   ([type name attributes]

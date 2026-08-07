@@ -9,15 +9,25 @@
 
 (def port 8080)
 
-(defn- app-handler
+(defn app-handler
   "The full Ring handler: `handler.clj`'s own `/state` dispatch (untouched),
   plus the new `POST /policy-check` route (`policy.clj`) layered in front of
-  it, both closing over the one dev-local `conn` this process holds."
+  it, both closing over the one dev-local `conn` this process holds. Any
+  other method on `/policy-check` gets an explicit `405` rather than
+  falling through to `state-handler` (which knows nothing about this route
+  and would 404 it). Public (rather than `defn-`) so it's directly
+  testable, mirroring `handler/handler`."
   [conn]
   (let [state-handler (handler/handler conn)]
     (fn [{:keys [request-method uri body] :as request}]
-      (if (and (= uri "/policy-check") (= request-method :post))
+      (cond
+        (and (= uri "/policy-check") (= request-method :post))
         (policy/policy-check conn (slurp body))
+
+        (= uri "/policy-check")
+        {:status 405 :headers {"Allow" "POST"} :body ""}
+
+        :else
         (state-handler request)))))
 
 (defn -main

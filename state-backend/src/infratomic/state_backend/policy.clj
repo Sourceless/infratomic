@@ -67,11 +67,31 @@
     (when (= 1 (count addresses))
       (first addresses))))
 
+(def ^:private identifying-attribute-keys
+  "The subset of each type's modeled `db/resource-schema` keys that are
+  identity attributes - AWS-assigned ids/foreign keys the
+  `security-groups-with-port-22-open` rule's join actually matches on (see
+  `db/resource-schema`'s docstring: `aws_security_group`'s `id` and
+  `aws_security_group_rule`'s `security_group_id` are modeled specifically
+  for that join). These are the only attributes eligible for Address
+  Stand-in substitution (ADR-0004, design.md's \"For each modeled
+  *identifying* attribute\"). Every other modeled attribute (e.g.
+  `from_port`/`to_port`/`protocol`/`cidr_blocks`) is an ordinary value -
+  frequently `null` at plan time for reasons unrelated to resource
+  identity - and must decompose normally, `nil` and all, via
+  `resource-attr-tx`/`decompose-attributes`; substituting an address
+  string into one of those would violate its Datomic type (a
+  `:db.type/long` or a `:db.cardinality/many :db.type/string` iterated
+  character-by-character) and crash the endpoint."
+  {"aws_security_group"      #{"id"}
+   "aws_security_group_rule" #{"security_group_id"}})
+
 (defn- identifying-keys
-  "The modeled attribute keys (per `db/resource-schema`) for `type` - the
-  attributes eligible for Address Stand-in resolution when unknown."
+  "The identifying attribute keys (`identifying-attribute-keys`) for
+  `type` - the attributes eligible for Address Stand-in resolution when
+  unknown."
   [type]
-  (set (keys (get db/resource-schema type))))
+  (get identifying-attribute-keys type #{}))
 
 (defn- resolve-address-stand-ins
   "Address Stand-in resolution (ADR-0004): for each of `type`'s modeled
