@@ -23,16 +23,16 @@
 
 ## 4. Terraform fixtures: network topology
 
-- [ ] 4.1 Add two `aws_vpc` resources
-- [ ] 4.2 Add `aws_subnet` resources: at least two subnets in one VPC (for same-subnet and same-VPC-different-subnet cases) and at least one subnet in the other VPC
-- [ ] 4.3 Add an `aws_internet_gateway` attached to the VPC that needs internet-bound reachability
-- [ ] 4.4 Add an `aws_vpc_peering_connection` between the two VPCs (plus the accepter/requester resources LocalStack needs, if any)
-- [ ] 4.5 Add `aws_route_table` resource(s) with `aws_route` entries: a local route is implicit (no resource needed), an explicit route to the internet gateway, and an explicit route to the peering connection
-- [ ] 4.6 Add `aws_route_table_association` resources wiring subnets to their route table(s)
-- [ ] 4.7 Move `ssh_open` and `https_only` (`terraform/security_groups.tf`) into one of the new VPCs via `vpc_id`
-- [ ] 4.8 Add `aws_instance` workloads placed across subnets/VPCs/security groups, covering: two in the same subnet, two in the same VPC but different subnets, and two in different VPCs — with SG rule pairs (egress+ingress, by CIDR or `source_security_group_id`) permitting traffic between the intended-reachable pairs
-- [ ] 4.9 Add the negative-fixture counterparts: an SG-blocked same-subnet pair, a cross-VPC pair with no peering connection at all, a cross-VPC pair where peering exists but the querying side's route is missing, and an internet-bound pair with no route to the internet gateway
-- [ ] 4.10 `terraform apply` against LocalStack and confirm `terraform state list` shows all new resources with no errors
+- [x] 4.1 Add two `aws_vpc` resources
+- [x] 4.2 Add `aws_subnet` resources: at least two subnets in one VPC (for same-subnet and same-VPC-different-subnet cases) and at least one subnet in the other VPC
+- [x] 4.3 Add an `aws_internet_gateway` attached to the VPC that needs internet-bound reachability
+- [x] 4.4 Add an `aws_vpc_peering_connection` between the two VPCs (plus the accepter/requester resources LocalStack needs, if any)
+- [x] 4.5 Add `aws_route_table` resource(s) with `aws_route` entries: a local route is implicit (no resource needed), an explicit route to the internet gateway, and an explicit route to the peering connection
+- [x] 4.6 Add `aws_route_table_association` resources wiring subnets to their route table(s)
+- [x] 4.7 Move `ssh_open` and `https_only` (`terraform/security_groups.tf`) into one of the new VPCs via `vpc_id`
+- [x] 4.8 Add `aws_instance` workloads placed across subnets/VPCs/security groups, covering: two in the same subnet, two in the same VPC but different subnets, and two in different VPCs — with SG rule pairs (egress+ingress, by CIDR or `source_security_group_id`) permitting traffic between the intended-reachable pairs
+- [x] 4.9 Add the negative-fixture counterparts: an SG-blocked same-subnet pair, a cross-VPC pair with no peering connection at all, a cross-VPC pair where peering exists but the querying side's route is missing, and an internet-bound pair with no route to the internet gateway
+- [x] 4.10 `terraform apply` against LocalStack and confirm `terraform state list` shows all new resources with no errors
 
 ## 5. Query: `reachable?` and its backing rules
 
@@ -54,4 +54,4 @@
 
 ## 7. Domain glossary
 
-- [ ] 7.1 Record "Workload" as the domain term for an `aws_instance` placed in the network graph, distinct from "the service" (existing alias for the State Backend), per alignment decision 10
+- [x] 7.1 Record "Workload" as the domain term for an `aws_instance` placed in the network graph, distinct from "the service" (existing alias for the State Backend), per alignment decision 10

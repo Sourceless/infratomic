@@ -194,14 +194,19 @@ read and write state exclusively through the service.
 
 ### Querying deployed infrastructure
 
-`state-backend/src/infratomic/state_backend/query.clj` provides 4 functions
+`state-backend/src/infratomic/state_backend/query.clj` provides functions
 proving that decomposed attributes answer real infrastructure questions as
 structural Datalog queries rather than JSON-blob scans: all deployed
 resources, resources by type, resources by attribute value (unified across
-generic and modeled/typed storage), and security groups with port 22 open
-to the internet (a join from `aws_security_group_rule`'s typed port/CIDR
-attributes back to its owning `aws_security_group`). These are functions
-only — called from tests, with no HTTP surface — see
+generic and modeled/typed storage), security groups with port 22 open to
+the internet (a join from `aws_security_group_rule`'s typed port/CIDR
+attributes back to its owning `aws_security_group`), and `reachable?` -
+whether one workload (`aws_instance`) can reach another, or the public
+internet (`"0.0.0.0/0"`), via a recursive Datalog rule set traversing the
+VPC/subnet/route-table/security-group graph (same-subnet, local-route-
+within-VPC, VPC-peering, and internet-gateway paths, each gated by
+forward-direction security group rules). These are functions only —
+called from tests, with no HTTP surface — see
 `state-backend/test/infratomic/state_backend/query_test.clj` for usage
 examples against an in-memory db.
 
