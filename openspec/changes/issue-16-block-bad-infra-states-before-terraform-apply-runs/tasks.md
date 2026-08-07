@@ -1,25 +1,25 @@
 ## 1. Plan-decomposition glue (state-backend)
 
-- [ ] 1.1 Add a new `infratomic.state-backend.policy` namespace (or similarly named module) alongside `handler.clj`/`query.clj`.
-- [ ] 1.2 Implement a function that, given a parsed `terraform show -json` document, extracts `planned_values.root_module.resources[]`.
-- [ ] 1.3 Implement Address Stand-in resolution: for each resource, for each modeled identifying attribute (per `db/resource-schema`) whose value is `null`, substitute the resource's own address (`type + "." + name`).
-- [ ] 1.4 Extend Address Stand-in resolution to cross-resource references: when an attribute is `null` but `configuration.root_module.resources[].expressions.<key>.references` names exactly one other resource, substitute that resource's address instead.
-- [ ] 1.5 Implement a function building one resource's speculative tx-map: `:resource/id` (`type + "." + name`), `:resource/type`, `:resource/name`, plus `(db/resource-attr-tx type values)` using the Address-Stand-in-resolved `values`.
-- [ ] 1.6 Implement a function building the full speculative tx-data for a plan document (all resources' tx-maps, no state-version entity).
+- [x] 1.1 Add a new `infratomic.state-backend.policy` namespace (or similarly named module) alongside `handler.clj`/`query.clj`.
+- [x] 1.2 Implement a function that, given a parsed `terraform show -json` document, extracts `planned_values.root_module.resources[]`.
+- [x] 1.3 Implement Address Stand-in resolution: for each resource, for each modeled identifying attribute (per `db/resource-schema`) whose value is `null`, substitute the resource's own address (`type + "." + name`).
+- [x] 1.4 Extend Address Stand-in resolution to cross-resource references: when an attribute is `null` but `configuration.root_module.resources[].expressions.<key>.references` names exactly one other resource, substitute that resource's address instead.
+- [x] 1.5 Implement a function building one resource's speculative tx-map: `:resource/id` (`type + "." + name`), `:resource/type`, `:resource/name`, plus `(db/resource-attr-tx type values)` using the Address-Stand-in-resolved `values`.
+- [x] 1.6 Implement a function building the full speculative tx-data for a plan document (all resources' tx-maps, no state-version entity).
 
 ## 2. Rule registry and Policy Check evaluation
 
-- [ ] 2.1 Define the Rule contract and a static vector of registered Rules containing `query/security-groups-with-port-22-open` (require `infratomic.state-backend.query`, do not modify it).
-- [ ] 2.2 Implement a function that, given a `conn` and a plan document, runs `(d/with (d/with-db conn) {:tx-data (speculative tx-data)})`, evaluates every registered Rule against `:db-after`, and returns a seq of Violations (rule identity + resource id/type) for every non-empty Rule result.
-- [ ] 2.3 Verify `d/with` is never followed by `d/transact` anywhere in this path — the speculative db must never be persisted.
+- [x] 2.1 Define the Rule contract and a static vector of registered Rules containing `query/security-groups-with-port-22-open` (require `infratomic.state-backend.query`, do not modify it).
+- [x] 2.2 Implement a function that, given a `conn` and a plan document, runs `(d/with (d/with-db conn) {:tx-data (speculative tx-data)})`, evaluates every registered Rule against `:db-after`, and returns a seq of Violations (rule identity + resource id/type) for every non-empty Rule result.
+- [x] 2.3 Verify `d/with` is never followed by `d/transact` anywhere in this path — the speculative db must never be persisted.
 
 ## 3. Policy Check HTTP endpoint
 
-- [ ] 3.1 Add a new route (e.g. `POST /policy-check`) to the Ring handler wired up in `main.clj`, backed by the function from 2.2.
-- [ ] 3.2 Parse the request body as the plan JSON document; respond `400` on invalid JSON, consistent with the existing `/state` endpoint's error handling style.
-- [ ] 3.3 Respond `200` with `{"violations": [...]}` (empty array when no Violations), JSON-encoding each Violation's rule identity and resource id/type.
-- [ ] 3.4 Add tests (fixture-based, per `handler_test.clj`'s pattern) covering: a plan with no violations, a plan violating the port-22 rule via an already-known id (existing SG being edited), and a plan violating the port-22 rule via Address Stand-ins (brand-new SG + rule, both `null` ids at plan time).
-- [ ] 3.5 Add a test confirming a Policy Check call leaves `GET /state`'s result unchanged (no persistence side effect).
+- [x] 3.1 Add a new route (e.g. `POST /policy-check`) to the Ring handler wired up in `main.clj`, backed by the function from 2.2.
+- [x] 3.2 Parse the request body as the plan JSON document; respond `400` on invalid JSON, consistent with the existing `/state` endpoint's error handling style.
+- [x] 3.3 Respond `200` with `{"violations": [...]}` (empty array when no Violations), JSON-encoding each Violation's rule identity and resource id/type.
+- [x] 3.4 Add tests (fixture-based, per `handler_test.clj`'s pattern) covering: a plan with no violations, a plan violating the port-22 rule via an already-known id (existing SG being edited), and a plan violating the port-22 rule via Address Stand-ins (brand-new SG + rule, both `null` ids at plan time).
+- [x] 3.5 Add a test confirming a Policy Check call leaves `GET /state`'s result unchanged (no persistence side effect).
 
 ## 4. CLI project scaffolding
 
