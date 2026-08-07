@@ -1,5 +1,5 @@
 (ns infratomic.state-backend.query-test
-  "Unit tests for the query namespace's 4 functions, exercised against an
+  "Unit tests for the query namespace's functions, exercised against an
   in-memory (non-persistent) Datomic dev-local database seeded via the
   handler's `POST` path - mirroring `handler_test.clj`'s fixture pattern -
   so query results are checked against realistically-decomposed data."
@@ -110,3 +110,113 @@
   (let [db (seeded-db)]
     (is (= #{"aws_security_group.ssh_open"}
            (ids (query/security-groups-with-port-22-open db))))))
+
+;; ---------------------------------------------------------------------------
+;; reachable? - network reachability via graph traversal
+;; ---------------------------------------------------------------------------
+
+;; A small multi-VPC network graph, purpose-built to exercise every
+;; `reachable?` path and its paired negative case:
+;;
+;; vpc-a (10.0.0.0/16)                    vpc-b (10.1.0.0/16)     vpc-c (10.2.0.0/16)
+;;   subnet-a1 (rt-a: IGW + peering)         subnet-b1 (rt-b)       subnet-c1 (rt-c)
+;;     instance-1, instance-2 (sg-open)        instance-6 (sg-open)   instance-8 (sg-open)
+;;     instance-3, instance-4 (sg-restricted)
+;;   subnet-a2 (rt-a: IGW + peering)
+;;     instance-5 (sg-open)
+;;   subnet-a3 (rt-a-isolated: no IGW, no peering route)
+;;     instance-7 (sg-open), instance-9 (sg-open)
+;;
+;; pcx-ab peers vpc-a <-> vpc-b. vpc-c has no peering connection at all.
+;; igw-a is vpc-a's internet gateway, routed only from rt-a (not
+;; rt-a-isolated).
+(def ^:private network-resources
+  [(resource "aws_vpc" "vpc_a" {"id" "vpc-a" "cidr_block" "10.0.0.0/16"})
+   (resource "aws_vpc" "vpc_b" {"id" "vpc-b" "cidr_block" "10.1.0.0/16"})
+   (resource "aws_vpc" "vpc_c" {"id" "vpc-c" "cidr_block" "10.2.0.0/16"})
+
+   (resource "aws_subnet" "subnet_a1" {"id" "subnet-a1" "vpc_id" "vpc-a" "cidr_block" "10.0.1.0/24"})
+   (resource "aws_subnet" "subnet_a2" {"id" "subnet-a2" "vpc_id" "vpc-a" "cidr_block" "10.0.2.0/24"})
+   (resource "aws_subnet" "subnet_a3" {"id" "subnet-a3" "vpc_id" "vpc-a" "cidr_block" "10.0.3.0/24"})
+   (resource "aws_subnet" "subnet_b1" {"id" "subnet-b1" "vpc_id" "vpc-b" "cidr_block" "10.1.1.0/24"})
+   (resource "aws_subnet" "subnet_c1" {"id" "subnet-c1" "vpc_id" "vpc-c" "cidr_block" "10.2.1.0/24"})
+
+   (resource "aws_route_table" "rt_a" {"id" "rt-a" "vpc_id" "vpc-a"})
+   (resource "aws_route_table" "rt_a_isolated" {"id" "rt-a-isolated" "vpc_id" "vpc-a"})
+   (resource "aws_route_table" "rt_b" {"id" "rt-b" "vpc_id" "vpc-b"})
+   (resource "aws_route_table" "rt_c" {"id" "rt-c" "vpc_id" "vpc-c"})
+
+   (resource "aws_internet_gateway" "igw" {"id" "igw-a" "vpc_id" "vpc-a"})
+   (resource "aws_vpc_peering_connection" "pcx_ab" {"id" "pcx-ab" "vpc_id" "vpc-a" "peer_vpc_id" "vpc-b"})
+
+   (resource "aws_route" "rt_a_igw" {"id" "route-a-igw" "route_table_id" "rt-a"
+                                      "destination_cidr_block" "0.0.0.0/0" "gateway_id" "igw-a"})
+   (resource "aws_route" "rt_a_pcx" {"id" "route-a-pcx" "route_table_id" "rt-a"
+                                      "destination_cidr_block" "10.1.0.0/16" "vpc_peering_connection_id" "pcx-ab"})
+   (resource "aws_route" "rt_b_pcx" {"id" "route-b-pcx" "route_table_id" "rt-b"
+                                      "destination_cidr_block" "10.0.0.0/16" "vpc_peering_connection_id" "pcx-ab"})
+
+   (resource "aws_route_table_association" "assoc_a1" {"id" "assoc-a1" "subnet_id" "subnet-a1" "route_table_id" "rt-a"})
+   (resource "aws_route_table_association" "assoc_a2" {"id" "assoc-a2" "subnet_id" "subnet-a2" "route_table_id" "rt-a"})
+   (resource "aws_route_table_association" "assoc_a3" {"id" "assoc-a3" "subnet_id" "subnet-a3" "route_table_id" "rt-a-isolated"})
+   (resource "aws_route_table_association" "assoc_b1" {"id" "assoc-b1" "subnet_id" "subnet-b1" "route_table_id" "rt-b"})
+   (resource "aws_route_table_association" "assoc_c1" {"id" "assoc-c1" "subnet_id" "subnet-c1" "route_table_id" "rt-c"})
+
+   (resource "aws_security_group" "sg_open" {"id" "sg-open" "vpc_id" "vpc-a"})
+   (resource "aws_security_group_rule" "sg_open_egress"
+             {"type" "egress" "from_port" 0 "to_port" 0 "protocol" "-1"
+              "security_group_id" "sg-open" "cidr_blocks" ["0.0.0.0/0"]})
+   (resource "aws_security_group_rule" "sg_open_ingress"
+             {"type" "ingress" "from_port" 0 "to_port" 0 "protocol" "-1"
+              "security_group_id" "sg-open" "cidr_blocks" ["0.0.0.0/0"]})
+
+   (resource "aws_security_group" "sg_restricted" {"id" "sg-restricted" "vpc_id" "vpc-a"})
+   (resource "aws_security_group_rule" "sg_restricted_egress"
+             {"type" "egress" "from_port" 0 "to_port" 0 "protocol" "-1"
+              "security_group_id" "sg-restricted" "cidr_blocks" ["192.168.99.0/24"]})
+
+   (resource "aws_instance" "instance_1" {"id" "instance-1" "subnet_id" "subnet-a1" "vpc_security_group_ids" ["sg-open"]})
+   (resource "aws_instance" "instance_2" {"id" "instance-2" "subnet_id" "subnet-a1" "vpc_security_group_ids" ["sg-open"]})
+   (resource "aws_instance" "instance_3" {"id" "instance-3" "subnet_id" "subnet-a1" "vpc_security_group_ids" ["sg-restricted"]})
+   (resource "aws_instance" "instance_4" {"id" "instance-4" "subnet_id" "subnet-a1" "vpc_security_group_ids" ["sg-restricted"]})
+   (resource "aws_instance" "instance_5" {"id" "instance-5" "subnet_id" "subnet-a2" "vpc_security_group_ids" ["sg-open"]})
+   (resource "aws_instance" "instance_6" {"id" "instance-6" "subnet_id" "subnet-b1" "vpc_security_group_ids" ["sg-open"]})
+   (resource "aws_instance" "instance_7" {"id" "instance-7" "subnet_id" "subnet-a1" "vpc_security_group_ids" ["sg-open"]})
+   (resource "aws_instance" "instance_8" {"id" "instance-8" "subnet_id" "subnet-c1" "vpc_security_group_ids" ["sg-open"]})
+   (resource "aws_instance" "instance_9" {"id" "instance-9" "subnet_id" "subnet-a3" "vpc_security_group_ids" ["sg-open"]})])
+
+(defn- network-db
+  []
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body network-resources))
+    (d/db conn)))
+
+(deftest reachable?-same-subnet
+  (let [db (network-db)]
+    (testing "positive: same subnet, SG permits"
+      (is (query/reachable? db "instance-1" "instance-2")))
+    (testing "negative: same subnet, SG blocks"
+      (is (not (query/reachable? db "instance-3" "instance-4"))))))
+
+(deftest reachable?-cross-vpc-via-peering
+  (let [db (network-db)]
+    (is (query/reachable? db "instance-5" "instance-6"))))
+
+(deftest reachable?-cross-vpc-negative-no-peering-connection
+  (let [db (network-db)]
+    (is (not (query/reachable? db "instance-7" "instance-8")))))
+
+(deftest reachable?-cross-vpc-negative-missing-route-despite-peering
+  (let [db (network-db)]
+    (is (not (query/reachable? db "instance-9" "instance-6")))))
+
+(deftest reachable?-internet-bound
+  (let [db (network-db)]
+    (testing "positive: route to IGW, egress permits"
+      (is (query/reachable? db "instance-1" "0.0.0.0/0")))
+    (testing "negative: no route to IGW"
+      (is (not (query/reachable? db "instance-9" "0.0.0.0/0"))))))
+
+(deftest reachable?-self
+  (let [db (network-db)]
+    (is (query/reachable? db "instance-3" "instance-3"))))

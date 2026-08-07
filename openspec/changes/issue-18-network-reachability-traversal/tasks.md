@@ -1,25 +1,25 @@
 ## 1. Spike: confirm Datomic client recursive rules work in dev-local
 
-- [ ] 1.1 Write a throwaway/minimal recursive Datomic rule (`:in $ %`) against the existing dev-local test harness and confirm it returns the expected transitive-closure result
-- [ ] 1.2 If dev-local rejects or mishandles the rules syntax, stop and flag it before proceeding — the design's approach depends on this working
+- [x] 1.1 Write a throwaway/minimal recursive Datomic rule (`:in $ %`) against the existing dev-local test harness and confirm it returns the expected transitive-closure result
+- [x] 1.2 If dev-local rejects or mishandles the rules syntax, stop and flag it before proceeding — the design's approach depends on this working
 
 ## 2. Schema: model the new resource types
 
-- [ ] 2.1 Add `aws_vpc` (`id`, `cidr_block`) to `resource-schema` in `state-backend/src/infratomic/state_backend/db.clj`
-- [ ] 2.2 Add `aws_subnet` (`id`, `vpc_id`, `cidr_block`) to `resource-schema`
-- [ ] 2.3 Add `aws_route_table` (`id`, `vpc_id`) to `resource-schema`
-- [ ] 2.4 Add `aws_route` (`id`, `route_table_id`, `destination_cidr_block`, `gateway_id`, `vpc_peering_connection_id`) to `resource-schema`
-- [ ] 2.5 Add `aws_route_table_association` (`id`, `subnet_id`, `route_table_id`) to `resource-schema`
-- [ ] 2.6 Add `aws_internet_gateway` (`id`, `vpc_id`) to `resource-schema`
-- [ ] 2.7 Add `aws_vpc_peering_connection` (`id`, `vpc_id`, `peer_vpc_id`) to `resource-schema`
-- [ ] 2.8 Add `aws_instance` (`id`, `subnet_id`, `vpc_security_group_ids` as many-cardinality) to `resource-schema`
+- [x] 2.1 Add `aws_vpc` (`id`, `cidr_block`) to `resource-schema` in `state-backend/src/infratomic/state_backend/db.clj`
+- [x] 2.2 Add `aws_subnet` (`id`, `vpc_id`, `cidr_block`) to `resource-schema`
+- [x] 2.3 Add `aws_route_table` (`id`, `vpc_id`) to `resource-schema`
+- [x] 2.4 Add `aws_route` (`id`, `route_table_id`, `destination_cidr_block`, `gateway_id`, `vpc_peering_connection_id`) to `resource-schema`
+- [x] 2.5 Add `aws_route_table_association` (`id`, `subnet_id`, `route_table_id`) to `resource-schema`
+- [x] 2.6 Add `aws_internet_gateway` (`id`, `vpc_id`) to `resource-schema`
+- [x] 2.7 Add `aws_vpc_peering_connection` (`id`, `vpc_id`, `peer_vpc_id`) to `resource-schema`
+- [x] 2.8 Add `aws_instance` (`id`, `subnet_id`, `vpc_security_group_ids` as many-cardinality) to `resource-schema`
 
 ## 3. Schema: extend existing modeled types
 
-- [ ] 3.1 Add `aws_security_group_rule.type` → `:aws-security-group-rule/type` to `resource-schema`
-- [ ] 3.2 Add `aws_security_group_rule.source_security_group_id` → `:aws-security-group-rule/source-security-group-id` to `resource-schema`
-- [ ] 3.3 Add `aws_security_group.vpc_id` → `:aws-security-group/vpc-id` to `resource-schema`
-- [ ] 3.4 Run `state-backend`'s existing test suite to confirm the schema additions don't regress current behavior (`clj -X:test` from `state-backend/`)
+- [x] 3.1 Add `aws_security_group_rule.type` → `:aws-security-group-rule/type` to `resource-schema`
+- [x] 3.2 Add `aws_security_group_rule.source_security_group_id` → `:aws-security-group-rule/source-security-group-id` to `resource-schema`
+- [x] 3.3 Add `aws_security_group.vpc_id` → `:aws-security-group/vpc-id` to `resource-schema`
+- [x] 3.4 Run `state-backend`'s existing test suite to confirm the schema additions don't regress current behavior (`clj -X:test` from `state-backend/`)
 
 ## 4. Terraform fixtures: network topology
 
@@ -36,21 +36,21 @@
 
 ## 5. Query: `reachable?` and its backing rules
 
-- [ ] 5.1 Implement the shared forward-direction SG-check sub-rule (source egress + target ingress, matching by CIDR or `source_security_group_id`) in `state-backend/src/infratomic/state_backend/query.clj`
-- [ ] 5.2 Implement the `reaches` recursive rule's self, same-subnet, and local-route-within-VPC clauses
-- [ ] 5.3 Implement the `reaches` rule's peering-route clause
-- [ ] 5.4 Implement the `reaches` rule's internet-gateway-route clause, handling a CIDR-string target (`"0.0.0.0/0"`) distinctly from a resource-identifier target
-- [ ] 5.5 Implement the public `reachable?` function wrapping the `reaches` rule set
+- [x] 5.1 Implement the shared forward-direction SG-check sub-rule (source egress + target ingress, matching by CIDR or `source_security_group_id`) in `state-backend/src/infratomic/state_backend/query.clj`
+- [x] 5.2 Implement the `reaches` recursive rule's self, same-subnet, and local-route-within-VPC clauses
+- [x] 5.3 Implement the `reaches` rule's peering-route clause
+- [x] 5.4 Implement the `reaches` rule's internet-gateway-route clause, handling a CIDR-string target (`"0.0.0.0/0"`) distinctly from a resource-identifier target
+- [x] 5.5 Implement the public `reachable?` function wrapping the `reaches` rule set
 
 ## 6. Tests
 
-- [ ] 6.1 Same-subnet: positive (reachable) and negative (SG-blocked) test cases in `state-backend/test/infratomic/state_backend/query_test.clj`
-- [ ] 6.2 Cross-VPC: positive (peering + routes + SG all permit) test case
-- [ ] 6.3 Cross-VPC negative: no peering connection at all
-- [ ] 6.4 Cross-VPC negative: peering connection exists but the querying side's route is missing
-- [ ] 6.5 Internet-bound: positive (route to IGW + permitting egress) and negative (no route to IGW) test cases
-- [ ] 6.6 Self-reachability: a resource always reaches itself, regardless of SG/route configuration
-- [ ] 6.7 Run `clj -X:test` from `state-backend/` and confirm `0 failures, 0 errors`
+- [x] 6.1 Same-subnet: positive (reachable) and negative (SG-blocked) test cases in `state-backend/test/infratomic/state_backend/query_test.clj`
+- [x] 6.2 Cross-VPC: positive (peering + routes + SG all permit) test case
+- [x] 6.3 Cross-VPC negative: no peering connection at all
+- [x] 6.4 Cross-VPC negative: peering connection exists but the querying side's route is missing
+- [x] 6.5 Internet-bound: positive (route to IGW + permitting egress) and negative (no route to IGW) test cases
+- [x] 6.6 Self-reachability: a resource always reaches itself, regardless of SG/route configuration
+- [x] 6.7 Run `clj -X:test` from `state-backend/` and confirm `0 failures, 0 errors`
 
 ## 7. Domain glossary
 

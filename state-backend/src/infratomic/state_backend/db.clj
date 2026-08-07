@@ -41,14 +41,56 @@
   from rule back to owning security group is a real Datalog value-equality
   join on typed attributes."
   {"aws_security_group"
-   {"id" {:ident :aws-security-group/id :value-type :db.type/string}}
+   {"id"     {:ident :aws-security-group/id :value-type :db.type/string}
+    "vpc_id" {:ident :aws-security-group/vpc-id :value-type :db.type/string}}
 
    "aws_security_group_rule"
-   {"from_port"         {:ident :aws-security-group-rule/from-port :value-type :db.type/long}
-    "to_port"           {:ident :aws-security-group-rule/to-port :value-type :db.type/long}
-    "protocol"          {:ident :aws-security-group-rule/protocol :value-type :db.type/string}
-    "security_group_id" {:ident :aws-security-group-rule/security-group-id :value-type :db.type/string}
-    "cidr_blocks"       {:ident :aws-security-group-rule/cidr-block :value-type :db.type/string :cardinality :db.cardinality/many}}})
+   {"from_port"                 {:ident :aws-security-group-rule/from-port :value-type :db.type/long}
+    "to_port"                   {:ident :aws-security-group-rule/to-port :value-type :db.type/long}
+    "protocol"                  {:ident :aws-security-group-rule/protocol :value-type :db.type/string}
+    "security_group_id"         {:ident :aws-security-group-rule/security-group-id :value-type :db.type/string}
+    "cidr_blocks"                {:ident :aws-security-group-rule/cidr-block :value-type :db.type/string :cardinality :db.cardinality/many}
+    "type"                      {:ident :aws-security-group-rule/type :value-type :db.type/string}
+    "source_security_group_id" {:ident :aws-security-group-rule/source-security-group-id :value-type :db.type/string}}
+
+   "aws_vpc"
+   {"id"         {:ident :aws-vpc/id :value-type :db.type/string}
+    "cidr_block" {:ident :aws-vpc/cidr-block :value-type :db.type/string}}
+
+   "aws_subnet"
+   {"id"         {:ident :aws-subnet/id :value-type :db.type/string}
+    "vpc_id"     {:ident :aws-subnet/vpc-id :value-type :db.type/string}
+    "cidr_block" {:ident :aws-subnet/cidr-block :value-type :db.type/string}}
+
+   "aws_route_table"
+   {"id"     {:ident :aws-route-table/id :value-type :db.type/string}
+    "vpc_id" {:ident :aws-route-table/vpc-id :value-type :db.type/string}}
+
+   "aws_route"
+   {"id"                        {:ident :aws-route/id :value-type :db.type/string}
+    "route_table_id"            {:ident :aws-route/route-table-id :value-type :db.type/string}
+    "destination_cidr_block"    {:ident :aws-route/destination-cidr-block :value-type :db.type/string}
+    "gateway_id"                {:ident :aws-route/gateway-id :value-type :db.type/string}
+    "vpc_peering_connection_id" {:ident :aws-route/vpc-peering-connection-id :value-type :db.type/string}}
+
+   "aws_route_table_association"
+   {"id"             {:ident :aws-route-table-association/id :value-type :db.type/string}
+    "subnet_id"      {:ident :aws-route-table-association/subnet-id :value-type :db.type/string}
+    "route_table_id" {:ident :aws-route-table-association/route-table-id :value-type :db.type/string}}
+
+   "aws_internet_gateway"
+   {"id"     {:ident :aws-internet-gateway/id :value-type :db.type/string}
+    "vpc_id" {:ident :aws-internet-gateway/vpc-id :value-type :db.type/string}}
+
+   "aws_vpc_peering_connection"
+   {"id"           {:ident :aws-vpc-peering-connection/id :value-type :db.type/string}
+    "vpc_id"       {:ident :aws-vpc-peering-connection/vpc-id :value-type :db.type/string}
+    "peer_vpc_id"  {:ident :aws-vpc-peering-connection/peer-vpc-id :value-type :db.type/string}}
+
+   "aws_instance"
+   {"id"                     {:ident :aws-instance/id :value-type :db.type/string}
+    "subnet_id"              {:ident :aws-instance/subnet-id :value-type :db.type/string}
+    "vpc_security_group_ids" {:ident :aws-instance/vpc-security-group-id :value-type :db.type/string :cardinality :db.cardinality/many}}})
 
 (defn- modeled-schema-entry
   [{:keys [ident value-type cardinality]}]
