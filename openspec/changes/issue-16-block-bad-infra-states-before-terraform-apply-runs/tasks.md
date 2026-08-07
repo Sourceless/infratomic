@@ -38,6 +38,6 @@
 
 ## 6. End-to-end verification
 
-- [ ] 6.1 Manually verify against the sample app: add a new insecure SG (port 22 from `0.0.0.0/0`), run the CLI's `apply` — expect non-zero exit, a printed violation naming the SG, and nothing created in LocalStack or posted to the State Backend.
-- [ ] 6.2 Fix the SG rule and re-run the CLI's `apply` — expect real `terraform apply` to proceed and succeed normally.
-- [ ] 6.3 Confirm every non-`apply` subcommand (e.g. `plan`, `init`, `state list`) behaves identically through the CLI as running `terraform` directly.
+- [x] 6.1 Manually verify against the sample app: add a new insecure SG (port 22 from `0.0.0.0/0`), run the CLI's `apply` — expect non-zero exit, a printed violation naming the SG, and nothing created in LocalStack or posted to the State Backend.
+- [x] 6.2 Fix the SG rule and re-run the CLI's `apply` — expect real `terraform apply` to proceed and succeed normally.
+- [x] 6.3 Confirm every non-`apply` subcommand (e.g. `plan`, `init`, `state list`) behaves identically through the CLI as running `terraform` directly.
