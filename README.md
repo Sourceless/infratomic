@@ -238,6 +238,57 @@ asserts on all 4 query functions' results, then destroys the sample app's
 resources again — safe to run repeatedly without polluting shared local
 dev state.
 
+## CLI (policy-gated `terraform apply`)
+
+`cli/` is a separate top-level Clojure project providing a drop-in
+replacement for the `terraform` binary: every subcommand passes straight
+through to the real `terraform` unchanged, except `apply`, which it
+intercepts to run a **Policy Check** first. It runs `terraform plan
+-out=tfplan`, converts the plan to JSON via `terraform show -json`, and
+POSTs that JSON to the State Backend's `POST /policy-check` endpoint (added
+alongside `/state`, in the same process, evaluating the plan against a
+static vector of Rules — starting with `security-groups-with-port-22-open`,
+reused unmodified from `query.clj` — against a speculative,
+never-persisted Datomic db). If the Policy Check reports any Violations,
+the CLI prints each one and exits non-zero without ever calling real
+`terraform apply`; otherwise it calls real `terraform apply tfplan` and
+passes through its exit code and output unchanged.
+
+### Running it
+
+With the State Backend already running (see above) and the real
+`terraform` binary on `PATH`, from inside `nix develop`, in `terraform/`
+(the CLI shells out to `terraform` in the process's own working
+directory, exactly like the real binary would):
+
+```sh
+clojure -Sdeps '{:deps {infratomic/cli {:local/root "../cli"}}}' -M -m infratomic.cli.main -- plan
+clojure -Sdeps '{:deps {infratomic/cli {:local/root "../cli"}}}' -M -m infratomic.cli.main -- apply
+```
+
+(the first behaves exactly like `terraform plan`; the second is gated on
+a Policy Check).
+
+(`-M -m` doesn't strip a literal `--` the way `-e` does; the CLI strips it
+back out itself before forwarding anything to the real `terraform`
+binary, so `-- <terraform args...>` is the documented invocation form.)
+
+The Policy Check endpoint's base URL defaults to the sample app's local
+State Backend address (`http://localhost:8080/policy-check`); override it
+via the `INFRATOMIC_POLICY_CHECK_URL` env var or a `--policy-check-url=`
+flag.
+
+### Verifying it worked
+
+1. Add a new insecure security group to `terraform/security_groups.tf`
+   (ingress on port 22 from `0.0.0.0/0`) and run the CLI's `apply` from
+   `terraform/`. Expect a non-zero exit, a printed Violation naming the new
+   security group, and nothing created in LocalStack or posted to the
+   State Backend (`terraform state list` / `GET /state` unchanged).
+2. Fix (or remove) that rule and re-run the CLI's `apply`. Expect real
+   `terraform apply` to proceed and succeed exactly as running `terraform
+   apply` directly would.
+
 ## License
 
 infratomic is licensed under the [Apache License 2.0](LICENSE).

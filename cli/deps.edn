@@ -1,0 +1,9 @@
+;; A separate top-level Clojure CLI project from state-backend/ - this is a
+;; thin, stateless HTTP client with no Datomic dependency at all (see
+;; design.md's "CLI structure" decision). JSON parsing is `cheshire`; the
+;; HTTP client is the JDK's own built-in `java.net.http.HttpClient` (JDK 11+
+;; - see flake.nix's `pkgs.jdk17`), so no separate HTTP-client library
+;; dependency is needed.
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        cheshire/cheshire {:mvn/version "6.2.0"}}}

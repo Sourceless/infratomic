@@ -23,18 +23,18 @@
 
 ## 4. CLI project scaffolding
 
-- [ ] 4.1 Create top-level `cli/` directory with its own `deps.edn` (Clojure CLI dependencies: JSON parsing, HTTP client).
-- [ ] 4.2 Create `cli/src/infratomic/cli/main.clj` with a `-main` entry point parsing the first non-flag argument as the Terraform subcommand.
-- [ ] 4.3 Implement passthrough: for any subcommand other than `apply`, invoke the real `terraform` binary with the given args, inheriting stdio, and exit with its exit code.
-- [ ] 4.4 Add a config point (env var and/or CLI flag) for the Policy Check endpoint's base URL, defaulting to the sample app's local State Backend address.
+- [x] 4.1 Create top-level `cli/` directory with its own `deps.edn` (Clojure CLI dependencies: JSON parsing, HTTP client).
+- [x] 4.2 Create `cli/src/infratomic/cli/main.clj` with a `-main` entry point parsing the first non-flag argument as the Terraform subcommand.
+- [x] 4.3 Implement passthrough: for any subcommand other than `apply`, invoke the real `terraform` binary with the given args, inheriting stdio, and exit with its exit code.
+- [x] 4.4 Add a config point (env var and/or CLI flag) for the Policy Check endpoint's base URL, defaulting to the sample app's local State Backend address.
 
 ## 5. CLI apply-gating flow
 
-- [ ] 5.1 On `apply`, shell out to `terraform plan -out=tfplan`, propagating a plan failure (non-zero exit) straight through without calling the Policy Check.
-- [ ] 5.2 On a successful plan, shell out to `terraform show -json tfplan` and parse its stdout as JSON.
-- [ ] 5.3 POST the parsed plan JSON to the Policy Check endpoint and parse the `{"violations": [...]}` response.
-- [ ] 5.4 If violations are present: print each Violation naming its rule and violating resource, exit non-zero, and do not invoke real `terraform apply`.
-- [ ] 5.5 If no violations: invoke `terraform apply tfplan`, inheriting stdio, and exit with its exit code.
+- [x] 5.1 On `apply`, shell out to `terraform plan -out=tfplan`, propagating a plan failure (non-zero exit) straight through without calling the Policy Check.
+- [x] 5.2 On a successful plan, shell out to `terraform show -json tfplan` and parse its stdout as JSON.
+- [x] 5.3 POST the parsed plan JSON to the Policy Check endpoint and parse the `{"violations": [...]}` response.
+- [x] 5.4 If violations are present: print each Violation naming its rule and violating resource, exit non-zero, and do not invoke real `terraform apply`.
+- [x] 5.5 If no violations: invoke `terraform apply tfplan`, inheriting stdio, and exit with its exit code.
 
 ## 6. End-to-end verification
 
