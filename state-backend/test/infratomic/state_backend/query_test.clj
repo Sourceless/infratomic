@@ -220,3 +220,109 @@
 (deftest reachable?-self
   (let [db (network-db)]
     (is (query/reachable? db "instance-3" "instance-3"))))
+
+;; ---------------------------------------------------------------------------
+;; reachable-within-hops? - multi-hop VPC peering chain reachability
+;; ---------------------------------------------------------------------------
+
+;; A 4-VPC A-B-C-D peering chain, independent from `network-resources` (so
+;; `vpc-c`'s role there as `reachable?`'s own deliberately-unpeered
+;; negative case is untouched). No direct shortcuts exist - only
+;; A<->B, B<->C, C<->D - so reaching A from D (or vice versa) requires
+;; walking the full 3-hop chain. Each VPC has one subnet, one `vpc_id`-owned
+;; route table (chain hops are joined at VPC granularity, not anchored to
+;; any particular subnet - see design.md), and one workload instance using
+;; a fresh permissive security group (`sg-chain-open`, not `network-resources`'s
+;; `sg-open`), so these tests exercise chain traversal, not SG logic.
+;; `vpc-chain-d` also has an internet gateway + default route, for the
+;; CIDR-target scenario.
+;;
+;; vpc-chain-a <-> vpc-chain-b <-> vpc-chain-c <-> vpc-chain-d (igw-chain)
+;;  instance-chain-a  instance-chain-b  instance-chain-c  instance-chain-d
+(defn- chain-network-resources
+  "The resources for the 4-VPC A-B-C-D peering chain fixture. When
+  `include-b-c-route?` is false, the B-side route naming the B<->C peering
+  connection is omitted, breaking the chain partway through without
+  mutating the full fixture (a separate fixture-building call, not a
+  mutation)."
+  [include-b-c-route?]
+  (cond-> [(resource "aws_vpc" "vpc_chain_a" {"id" "vpc-chain-a" "cidr_block" "10.20.0.0/16"})
+           (resource "aws_vpc" "vpc_chain_b" {"id" "vpc-chain-b" "cidr_block" "10.21.0.0/16"})
+           (resource "aws_vpc" "vpc_chain_c" {"id" "vpc-chain-c" "cidr_block" "10.22.0.0/16"})
+           (resource "aws_vpc" "vpc_chain_d" {"id" "vpc-chain-d" "cidr_block" "10.23.0.0/16"})
+
+           (resource "aws_subnet" "subnet_chain_a" {"id" "subnet-chain-a" "vpc_id" "vpc-chain-a" "cidr_block" "10.20.1.0/24"})
+           (resource "aws_subnet" "subnet_chain_b" {"id" "subnet-chain-b" "vpc_id" "vpc-chain-b" "cidr_block" "10.21.1.0/24"})
+           (resource "aws_subnet" "subnet_chain_c" {"id" "subnet-chain-c" "vpc_id" "vpc-chain-c" "cidr_block" "10.22.1.0/24"})
+           (resource "aws_subnet" "subnet_chain_d" {"id" "subnet-chain-d" "vpc_id" "vpc-chain-d" "cidr_block" "10.23.1.0/24"})
+
+           (resource "aws_route_table" "rt_chain_a" {"id" "rt-chain-a" "vpc_id" "vpc-chain-a"})
+           (resource "aws_route_table" "rt_chain_b" {"id" "rt-chain-b" "vpc_id" "vpc-chain-b"})
+           (resource "aws_route_table" "rt_chain_c" {"id" "rt-chain-c" "vpc_id" "vpc-chain-c"})
+           (resource "aws_route_table" "rt_chain_d" {"id" "rt-chain-d" "vpc_id" "vpc-chain-d"})
+
+           (resource "aws_internet_gateway" "igw_chain" {"id" "igw-chain" "vpc_id" "vpc-chain-d"})
+
+           (resource "aws_vpc_peering_connection" "pcx_chain_ab" {"id" "pcx-chain-ab" "vpc_id" "vpc-chain-a" "peer_vpc_id" "vpc-chain-b"})
+           (resource "aws_vpc_peering_connection" "pcx_chain_bc" {"id" "pcx-chain-bc" "vpc_id" "vpc-chain-b" "peer_vpc_id" "vpc-chain-c"})
+           (resource "aws_vpc_peering_connection" "pcx_chain_cd" {"id" "pcx-chain-cd" "vpc_id" "vpc-chain-c" "peer_vpc_id" "vpc-chain-d"})
+
+           (resource "aws_route" "rt_chain_a_pcx_ab" {"id" "route-chain-a-pcx-ab" "route_table_id" "rt-chain-a"
+                                                        "destination_cidr_block" "10.21.0.0/16" "vpc_peering_connection_id" "pcx-chain-ab"})
+           (resource "aws_route" "rt_chain_b_pcx_ab" {"id" "route-chain-b-pcx-ab" "route_table_id" "rt-chain-b"
+                                                        "destination_cidr_block" "10.20.0.0/16" "vpc_peering_connection_id" "pcx-chain-ab"})
+           (resource "aws_route" "rt_chain_c_pcx_bc" {"id" "route-chain-c-pcx-bc" "route_table_id" "rt-chain-c"
+                                                        "destination_cidr_block" "10.21.0.0/16" "vpc_peering_connection_id" "pcx-chain-bc"})
+           (resource "aws_route" "rt_chain_c_pcx_cd" {"id" "route-chain-c-pcx-cd" "route_table_id" "rt-chain-c"
+                                                        "destination_cidr_block" "10.23.0.0/16" "vpc_peering_connection_id" "pcx-chain-cd"})
+           (resource "aws_route" "rt_chain_d_pcx_cd" {"id" "route-chain-d-pcx-cd" "route_table_id" "rt-chain-d"
+                                                        "destination_cidr_block" "10.22.0.0/16" "vpc_peering_connection_id" "pcx-chain-cd"})
+           (resource "aws_route" "rt_chain_d_igw" {"id" "route-chain-d-igw" "route_table_id" "rt-chain-d"
+                                                     "destination_cidr_block" "0.0.0.0/0" "gateway_id" "igw-chain"})
+
+           (resource "aws_security_group" "sg_chain_open" {"id" "sg-chain-open" "vpc_id" "vpc-chain-a"})
+           (resource "aws_security_group_rule" "sg_chain_open_egress"
+                     {"type" "egress" "from_port" 0 "to_port" 0 "protocol" "-1"
+                      "security_group_id" "sg-chain-open" "cidr_blocks" ["0.0.0.0/0"]})
+           (resource "aws_security_group_rule" "sg_chain_open_ingress"
+                     {"type" "ingress" "from_port" 0 "to_port" 0 "protocol" "-1"
+                      "security_group_id" "sg-chain-open" "cidr_blocks" ["0.0.0.0/0"]})
+
+           (resource "aws_instance" "instance_chain_a" {"id" "instance-chain-a" "subnet_id" "subnet-chain-a" "vpc_security_group_ids" ["sg-chain-open"]})
+           (resource "aws_instance" "instance_chain_b" {"id" "instance-chain-b" "subnet_id" "subnet-chain-b" "vpc_security_group_ids" ["sg-chain-open"]})
+           (resource "aws_instance" "instance_chain_c" {"id" "instance-chain-c" "subnet_id" "subnet-chain-c" "vpc_security_group_ids" ["sg-chain-open"]})
+           (resource "aws_instance" "instance_chain_d" {"id" "instance-chain-d" "subnet_id" "subnet-chain-d" "vpc_security_group_ids" ["sg-chain-open"]})]
+    include-b-c-route?
+    (conj (resource "aws_route" "rt_chain_b_pcx_bc" {"id" "route-chain-b-pcx-bc" "route_table_id" "rt-chain-b"
+                                                       "destination_cidr_block" "10.22.0.0/16" "vpc_peering_connection_id" "pcx-chain-bc"}))))
+
+(defn- chain-db
+  []
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body (chain-network-resources true)))
+    (d/db conn)))
+
+(defn- broken-chain-db
+  "The A-B-C-D chain fixture with the B-side route naming the B<->C
+  peering connection omitted, breaking the chain partway through - a
+  separate fixture-building call, not a mutation of `chain-db`."
+  []
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body (chain-network-resources false)))
+    (d/db conn)))
+
+(deftest reachable-within-hops?-full-chain
+  (let [db (chain-db)]
+    (is (query/reachable-within-hops? db "instance-chain-a" "instance-chain-d" 3))))
+
+(deftest reachable-within-hops?-broken-link
+  (let [db (broken-chain-db)]
+    (is (not (query/reachable-within-hops? db "instance-chain-a" "instance-chain-d" 5)))))
+
+(deftest reachable-within-hops?-hop-limit-too-low
+  (let [db (chain-db)]
+    (is (not (query/reachable-within-hops? db "instance-chain-a" "instance-chain-d" 2)))))
+
+(deftest reachable-within-hops?-self
+  (let [db (chain-db)]
+    (is (query/reachable-within-hops? db "instance-chain-a" "instance-chain-a" 0))))
