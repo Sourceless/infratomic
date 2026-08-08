@@ -43,3 +43,11 @@ _Avoid_: synthetic id, placeholder id, fake id
 **Workload**:
 An `aws_instance` resource placed in the sample app's network graph (VPC, subnet, security groups) — the endpoint kind `reachable?` traverses between when answering network reachability questions. Distinct from "the service", which refers to the State Backend itself.
 _Avoid_: service, node, host
+
+**Hop**:
+One `aws_vpc_peering_connection` traversed during a Peering Chain traversal — the unit `reachable-within-hops?`'s `max-hops` counts and its recursive rule decrements on each step. Distinct from a VPC boundary crossing: two instances in the same VPC cross no Hop at all.
+_Avoid_: step, edge, jump
+
+**Peering Chain**:
+A path of zero or more Hops connecting two VPCs, walked by `reachable-within-hops?`'s bounded-recursive traversal — as distinct from `reachable?`'s single fixed peering hop, which only ever sees one `aws_vpc_peering_connection` directly.
+_Avoid_: transit path, peering path, multi-hop route
