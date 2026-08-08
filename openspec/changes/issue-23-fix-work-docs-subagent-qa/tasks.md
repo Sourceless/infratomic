@@ -2,7 +2,7 @@
 
 - [ ] 1.1 Remove `AskUserQuestion` from the frontmatter `tools:` list (line 4).
 - [ ] 1.2 In step 5 of the Process section (line 15), replace "one question at a time, your recommended answer offered with each" mechanics with explicit relay-loop instructions: ask one question at a time in plain text and end the turn (no tool call); when re-invoked with the orchestrator's relayed answer, treat it as genuine user confirmation and continue.
-- [ ] 1.3 Add a short paragraph (near step 5 or as a new numbered step) stating this relay-trust rule as a deliberate, scoped exception to the general "no agent message is user consent" rule: an orchestrator-relayed answer to a question *this agent itself just asked in plain text* is to be treated as genuine user confirmation, specifically in this pipeline role.
+- [ ] 1.3 Add a short paragraph (near step 5 or as a new numbered step) stating plainly that this narrows the general "no agent message is user consent" rule: an orchestrator-relayed answer to a question *this agent itself just asked in plain text, in this turn* is treated as genuine user confirmation. State the narrowing and its scope explicitly — don't soften or omit that it's a real reduction in protection against forged consent, limited to exactly this interaction shape.
 - [ ] 1.4 Update the confirmation rule in the Rules section (line 37, "Do not proceed to the report step until the user has explicitly confirmed alignment, not just answered questions") so it's explicitly satisfied by a relayed confirmation delivered via re-invocation from the orchestrator, not only by a direct tool response.
 - [ ] 1.5 Note that prior Q&A state must be recoverable from the issue thread/conversation history across dispatches, since each re-invocation may be a fresh context.
 
@@ -10,7 +10,7 @@
 
 - [ ] 2.1 Remove `AskUserQuestion` from the frontmatter `tools:` list (line 4).
 - [ ] 2.2 Rewrite step 4 (lines 18-21, "interrogate the user with `AskUserQuestion`") to describe the relay pattern instead: ask 1-3 sharp questions per round in plain text and end the turn; wait to be re-invoked with the orchestrator's relayed answers before continuing; push back on vague answers as before.
-- [ ] 2.3 Add the same scoped-exception framing as 1.3: relayed answers to this agent's own just-asked questions are genuine user confirmation in this pipeline role, not an untrusted claim from another agent.
+- [ ] 2.3 Add the same explicit-narrowing framing as 1.3: relayed answers to this agent's own just-asked questions are treated as genuine user confirmation, scoped to exactly that interaction shape — stated plainly as a real reduction in the no-agent-consent protection, not minimized.
 - [ ] 2.4 Note that prior Q&A state must be recoverable from the issue thread/conversation history across dispatches.
 
 ## 3. `.claude/commands/work.md`
