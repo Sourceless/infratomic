@@ -8,7 +8,7 @@ You are the **orchestrator** for this repo's SDLC. Argument: `$ARGUMENTS` — a 
 
 Every stage below runs as a dedicated subagent (`sdlc-elaborate`, `sdlc-research`, `sdlc-interrogate`, `sdlc-propose`, `sdlc-implement`, `sdlc-review`, `sdlc-merge`) via the `Agent` tool, so each keeps its own tight context instead of accumulating in yours. Your job is only to read enough state to decide what's next, dispatch the right stage, and re-check state after each one — never do a stage's work yourself.
 
-**Run every stage in the foreground** (`run_in_background: false`). Stages are strictly sequential — each depends on the previous one's output — and two of them (`sdlc-elaborate`, `sdlc-interrogate`) ask the user direct questions, which only reach the user if the agent is in the foreground. Never fire a stage and move on without its result.
+**Run every stage in the foreground** (`run_in_background: false`). Stages are strictly sequential — each depends on the previous one's output. Two of them (`sdlc-elaborate`, `sdlc-interrogate`) have no tool that reaches the user directly: they ask their question in plain text and end their turn, and it is you, the foreground orchestrator, who must see that turn, relay the question to the user via `AskUserQuestion`, and re-invoke the subagent with the user's answer before it can continue. If you were backgrounded you would never see the question to relay it, and the subagent would stall waiting for an answer that never arrives. Never fire a stage and move on without its result.
 
 ## Conventions this pipeline relies on
 
@@ -50,6 +50,8 @@ Walk this decision list top to bottom. Run the **first** stage whose condition i
 ## Dispatch pattern
 
 For each stage, call `Agent` with `subagent_type` set to the stage's agent name (e.g. `sdlc-research`), `run_in_background: false`, and a prompt containing just the issue number and any specific reason you're invoking it (e.g. "CI is failing on check X" or "review returned CHANGES_REQUESTED, findings: ..."). Do not re-paste the full issue body or prior comments into the prompt — the subagent reads those itself; keep your dispatch prompt short.
+
+`sdlc-elaborate` and `sdlc-interrogate` are multi-turn: a single dispatch may end with the subagent asking a plain-text question instead of a final report. When that happens, relay the question to the user via `AskUserQuestion`, then re-invoke the same stage with the user's answer — repeating relay-then-re-invoke until the subagent's report-back arrives, rather than treating the first response as the stage's result.
 
 ## Final report
 
