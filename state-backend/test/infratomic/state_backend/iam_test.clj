@@ -222,6 +222,49 @@
     (is (iam/iam-reachable? db "aws_iam_role.role_deny" "aws_s3_bucket.bucket_deny" "s3:PutObject"))))
 
 ;; ---------------------------------------------------------------------------
+;; Deny naming a different principal does not block (regression: a
+;; resource-based/trust Deny scoped to one principal must not shadow every
+;; other principal's otherwise-granted access - PR #25 review finding).
+;; ---------------------------------------------------------------------------
+
+(def ^:private deny-other-principal-resources
+  [(resource "aws_iam_role" "role_deny_other_allowed"
+             {"id" "role-deny-other-allowed" "name" "role-deny-other-allowed"
+              "arn" "arn:aws:iam::000000000000:role/role-deny-other-allowed"})
+   (resource "aws_iam_role" "role_deny_other_denied"
+             {"id" "role-deny-other-denied" "name" "role-deny-other-denied"
+              "arn" "arn:aws:iam::000000000000:role/role-deny-other-denied"})
+   (resource "aws_s3_bucket" "bucket_deny_other"
+             {"bucket" "bucket-deny-other" "arn" "arn:aws:s3:::bucket-deny-other"})
+   (resource "aws_s3_bucket_policy" "bucket_deny_other_policy"
+             {"bucket" "bucket-deny-other"
+              "policy" (policy-doc
+                        ;; Allow for role-deny-other-allowed...
+                        (stmt {:effect "Allow" :actions ["s3:GetObject"]
+                               :resources ["arn:aws:s3:::bucket-deny-other"]
+                               :principal (aws-principal "arn:aws:iam::000000000000:role/role-deny-other-allowed")})
+                        ;; ...role-deny-other-denied also has its own Allow,
+                        ;; so the negative assertion below proves the Deny
+                        ;; actually blocks it (not merely "no Allow exists")...
+                        (stmt {:effect "Allow" :actions ["s3:GetObject"]
+                               :resources ["arn:aws:s3:::bucket-deny-other"]
+                               :principal (aws-principal "arn:aws:iam::000000000000:role/role-deny-other-denied")})
+                        ;; ...and a Deny naming only role-deny-other-denied,
+                        ;; same action/resource - must block that principal
+                        ;; without blocking the unrelated Allow above.
+                        (stmt {:effect "Deny" :actions ["s3:GetObject"]
+                               :resources ["arn:aws:s3:::bucket-deny-other"]
+                               :principal (aws-principal "arn:aws:iam::000000000000:role/role-deny-other-denied")}))})])
+
+(deftest iam-reachable?-resource-based-deny-naming-different-principal-does-not-block
+  (let [db (db-with-resources deny-other-principal-resources)]
+    (is (iam/iam-reachable? db "aws_iam_role.role_deny_other_allowed" "aws_s3_bucket.bucket_deny_other" "s3:GetObject"))))
+
+(deftest iam-reachable?-resource-based-deny-naming-matching-principal-blocks
+  (let [db (db-with-resources deny-other-principal-resources)]
+    (is (not (iam/iam-reachable? db "aws_iam_role.role_deny_other_denied" "aws_s3_bucket.bucket_deny_other" "s3:GetObject")))))
+
+;; ---------------------------------------------------------------------------
 ;; Glob matching via iam-reachable? (tasks.md 6.7) - distinct from the
 ;; direct glob-matches? unit tests above and from every fixture-level test,
 ;; whose statements above use literal (non-wildcard) actions/resources.

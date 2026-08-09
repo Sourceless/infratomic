@@ -253,9 +253,11 @@
   - `identity-denies`/`resource-denies ?principal ?action ?resource` and
     `denied? ?principal ?action ?resource`: the same shape, but for `Deny`
     statements (`resource-denies` covers both `:resource` and `:trust`
-    kinds), scoped only to the action/resource in question - never a
-    principal check, and never a blanket \"any deny exists\" check - per
-    design.md's scoped-deny-override decision.
+    kinds), scoped to the action/resource/principal in question - matching
+    `?principal` against the statement's `Principal` the same way
+    `resource-allows`/`trust-allows` do (a Deny naming one principal must
+    not block every other principal's access) - and never a blanket \"any
+    deny exists\" check - per design.md's scoped-deny-override decision.
 
   - `grants ?principal ?action ?resource`: the public recursive rule.
     Direct access (identity-side OR resource-side Allow, not gated to
@@ -333,7 +335,10 @@
      [(infratomic.state-backend.iam/glob-matches? ?apattern ?action)]
      [?stmt :iam-statement/resource ?rpattern]
      (resource-arn ?resource ?resource-arn)
-     [(infratomic.state-backend.iam/glob-matches? ?rpattern ?resource-arn)]]
+     [(infratomic.state-backend.iam/glob-matches? ?rpattern ?resource-arn)]
+     [?stmt :iam-statement/principal ?ppattern]
+     (resource-arn ?principal ?principal-arn)
+     [(infratomic.state-backend.iam/glob-matches? ?ppattern ?principal-arn)]]
 
     [(resource-denies ?principal ?action ?resource)
      [?resource-e :resource/id ?resource]
@@ -341,7 +346,10 @@
      [?stmt :iam-statement/kind :trust]
      [?stmt :iam-statement/effect "Deny"]
      [?stmt :iam-statement/action ?apattern]
-     [(infratomic.state-backend.iam/glob-matches? ?apattern ?action)]]
+     [(infratomic.state-backend.iam/glob-matches? ?apattern ?action)]
+     [?stmt :iam-statement/principal ?ppattern]
+     (resource-arn ?principal ?principal-arn)
+     [(infratomic.state-backend.iam/glob-matches? ?ppattern ?principal-arn)]]
 
     [(denied? ?principal ?action ?resource)
      (identity-denies ?principal ?action ?resource)]
