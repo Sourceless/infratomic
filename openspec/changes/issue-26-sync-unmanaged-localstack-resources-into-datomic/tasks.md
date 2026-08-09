@@ -1,11 +1,11 @@
 ## 1. `:resource/managed?` tagging and read-path filters
 
-- [ ] 1.1 Add `:resource/managed?` (`:db.type/boolean`, `:db.cardinality/one`) to `db.clj`'s `schema`.
-- [ ] 1.2 Update `handler.clj`'s `resource->tx` to set `:resource/managed? true` on every `POST /state` managed resource's tx-map.
-- [ ] 1.3 Update `db.clj`'s `all-resource-eids`/`all-resources` (or add a filtered variant used by `GET /state`) so `reconstruct-state` only includes `:resource/managed? true` entities.
-- [ ] 1.4 Update `handler.clj`'s `stale-resource-retractions` so its "existing" set (candidates for retraction) is limited to `:resource/managed? true` entities.
-- [ ] 1.5 Add a backfill step to `db.clj`'s `ensure-db!`: after transacting schema, find every resource entity with no `:resource/managed?` value and transact `:resource/managed? true` on it. Confirm it's a no-op on a second call.
-- [ ] 1.6 Add/update tests: a `POST /state` resource is tagged managed; a manually-transacted `:resource/managed? false` entity is excluded from `GET /state`; such an entity survives a `POST /state` that doesn't mention it; the backfill tags pre-existing untagged entities and is idempotent.
+- [x] 1.1 Add `:resource/managed?` (`:db.type/boolean`, `:db.cardinality/one`) to `db.clj`'s `schema`.
+- [x] 1.2 Update `handler.clj`'s `resource->tx` to set `:resource/managed? true` on every `POST /state` managed resource's tx-map.
+- [x] 1.3 Update `db.clj`'s `all-resource-eids`/`all-resources` (or add a filtered variant used by `GET /state`) so `reconstruct-state` only includes `:resource/managed? true` entities.
+- [x] 1.4 Update `handler.clj`'s `stale-resource-retractions` so its "existing" set (candidates for retraction) is limited to `:resource/managed? true` entities.
+- [x] 1.5 Add a backfill step to `db.clj`'s `ensure-db!`: after transacting schema, find every resource entity with no `:resource/managed?` value and transact `:resource/managed? true` on it. Confirm it's a no-op on a second call.
+- [x] 1.6 Add/update tests: a `POST /state` resource is tagged managed; a manually-transacted `:resource/managed? false` entity is excluded from `GET /state`; such an entity survives a `POST /state` that doesn't mention it; the backfill tags pre-existing untagged entities and is idempotent.
 
 ## 2. `aws_security_group_rule` id and AWS-shape translation
 
