@@ -51,3 +51,19 @@ _Avoid_: step, edge, jump
 **Peering Chain**:
 A path of zero or more Hops connecting two VPCs, walked by `reachable-within-hops?`'s bounded-recursive traversal — as distinct from `reachable?`'s single fixed peering hop, which only ever sees one `aws_vpc_peering_connection` directly.
 _Avoid_: transit path, peering path, multi-hop route
+
+**Principal**:
+The IAM identity (always an `aws_iam_role` in this system's scope — no `aws_iam_user`) that `iam-reachable?` asks "can this act?" about. Identified by its `:resource/id` (e.g. `"aws_iam_role.source"`), resolved to its ARN only when a Policy Statement needs to match it against a `Principal` field. Distinct from a Workload, which is the network graph's own endpoint concept.
+_Avoid_: identity, actor, subject
+
+**Policy Statement**:
+One `Effect`/`Action`/`Resource`/`Principal` entry from a parsed IAM policy document (`assume_role_policy`, an inline `aws_iam_role_policy`, an `aws_s3_bucket_policy`, or an `aws_iam_policy` reached via `aws_iam_role_policy_attachment`), decomposed at query time (never persisted) into a scratch `:iam-statement/*` Datomic entity so the `grants` rule can traverse real datoms instead of parsed JSON. Tagged `:identity`, `:resource`, or `:trust` depending which side of a grant it evaluates. See `docs/adr/0005-derive-iam-policy-facts-at-query-time-via-speculative-db.md`.
+_Avoid_: policy rule, grant record, ACL entry
+
+**Trust Policy**:
+An `aws_iam_role`'s `assume_role_policy` — the Policy Statement(s) naming which principals may `sts:AssumeRole` it. Modeled as an ordinary resource-based Policy Statement (kind `:trust`, sourced from the assumed role's own entity) rather than a separate mechanism, so the same allow/deny-override logic that evaluates every other resource-based statement evaluates role assumption too.
+_Avoid_: assume-role policy (as a distinct mechanism), trust relationship
+
+**IAM-reachable**:
+The result of `iam-reachable?`: whether a Principal can perform a given IAM action on a given resource, per the deployed IAM policy graph — identity-based Policy Statements, resource-based Policy Statements, and role-assumption chains of Trust Policies, with explicit-deny-overrides-allow semantics — evaluated as recursive Datalog (`grants`), not an application-level walk of parsed policy JSON. Distinct from Reachable, which answers network reachability, not IAM access.
+_Avoid_: has access, is authorized, can assume
