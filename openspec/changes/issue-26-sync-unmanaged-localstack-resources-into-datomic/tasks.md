@@ -27,9 +27,9 @@
 
 ## 4. `POST /sync` HTTP endpoint
 
-- [ ] 4.1 Add a `POST /sync` route to `main.clj`'s `app-handler`, alongside `/policy-check`, closing over the shared `conn`; respond `405` for other methods on `/sync`.
-- [ ] 4.2 Wire the route to the Sync pass (section 3), responding `200` with the JSON-encoded summary.
-- [ ] 4.3 Add a handler-level test (per `handler_test.clj`'s pattern) covering: `POST /sync` with LocalStack resources present returns a summary reflecting them; a non-`POST` method on `/sync` returns `405`.
+- [x] 4.1 Add a `POST /sync` route to `main.clj`'s `app-handler`, alongside `/policy-check`, closing over the shared `conn`; respond `405` for other methods on `/sync`.
+- [x] 4.2 Wire the route to the Sync pass (section 3), responding `200` with the JSON-encoded summary.
+- [x] 4.3 Add a handler-level test (per `handler_test.clj`'s pattern) covering: `POST /sync` with LocalStack resources present returns a summary reflecting them; a non-`POST` method on `/sync` returns `405`.
 
 ## 5. CLI `sync` subcommand
 

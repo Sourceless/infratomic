@@ -17,13 +17,15 @@
   connection, apply-then-destroy the sample app in a `finally`) - see that
   namespace's docstring for why (Datomic dev-local's exclusive connection
   lock)."
-  (:require [clojure.java.io :as io]
+  (:require [cheshire.core :as json]
+            [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.test :refer [deftest is testing]]
             [cognitect.aws.client.api :as aws]
             [datomic.client.api :as d]
             [infratomic.state-backend.db :as db]
             [infratomic.state-backend.handler :as handler]
+            [infratomic.state-backend.main :as main]
             [infratomic.state-backend.sync :as sync]
             [ring.adapter.jetty :as jetty]))
 
@@ -134,4 +136,25 @@
                 ;; (mirrors query_integration_test.clj's "safe to run
                 ;; repeatedly" property).
                 (aws/invoke client {:op :DeleteSecurityGroup :request {:GroupId sg-id}})
+                (aws/stop client)))))))))
+
+(deftest post-sync-endpoint-returns-a-summary-reflecting-real-localstack-resources
+  (with-state-backend-server
+    (fn [conn]
+      (with-applied-sample-app
+        (fn []
+          (let [client       (sync/ec2-client)
+                sync-handler (main/app-handler conn client)]
+            (try
+              (let [response (sync-handler {:request-method :post :uri "/sync"})
+                    body     (json/parse-string (:body response))]
+                (is (= 200 (:status response)))
+                (testing "the response summary reflects real LocalStack resources"
+                  (is (seq (get body "discovered")))
+                  (is (every? #(and (contains? % "type") (contains? % "id")) (get body "discovered"))))
+                (testing "the sample app's Terraform-managed security groups are reflected as skipped, not re-discovered"
+                  (is (not (contains? (into #{} (map #(get % "id")) (get body "discovered"))
+                                       "aws_security_group.ssh_open")))
+                  (is (pos? (get body "skipped_already_managed")))))
+              (finally
                 (aws/stop client)))))))))

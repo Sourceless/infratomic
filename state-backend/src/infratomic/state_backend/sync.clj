@@ -27,7 +27,8 @@
      and transact accordingly - a fresh discovery, an update to a
      previously-discovered entity, or a no-op skip when the match is
      already Terraform-managed."
-  (:require [clojure.core.async :as a]
+  (:require [cheshire.core :as json]
+            [clojure.core.async :as a]
             [clojure.string :as str]
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as credentials]
@@ -397,3 +398,29 @@
     {:discovered              (mapv :entry (filter #(= :discovered (:outcome %)) decisions))
      :updated                 (mapv :entry (filter #(= :updated (:outcome %)) decisions))
      :skipped-already-managed (count (filter #(= :skipped-already-managed (:outcome %)) decisions))}))
+
+;; ---------------------------------------------------------------------------
+;; HTTP handler
+;; ---------------------------------------------------------------------------
+
+(defn- entry->json
+  [{:keys [type id]}]
+  {"type" type "id" id})
+
+(defn- summary->json
+  [{:keys [discovered updated skipped-already-managed]}]
+  {"discovered"               (mapv entry->json discovered)
+   "updated"                  (mapv entry->json updated)
+   "skipped_already_managed"  skipped-already-managed})
+
+(defn sync-endpoint
+  "Handle a `POST /sync` request: run the full Sync pass (`sync!`) against
+  `conn`/`client`, and respond `200` with the JSON-encoded summary
+  (design.md's \"POST /sync endpoint shape\") - `{\"discovered\": [{\"type\"
+  ... \"id\" ...} ...], \"updated\": [...], \"skipped_already_managed\": N}`.
+  Takes no request body - Sync's inputs are \"whatever LocalStack currently
+  has\", not a client-supplied document."
+  [conn client]
+  {:status  200
+   :headers {"Content-Type" "application/json"}
+   :body    (json/generate-string (summary->json (sync! conn client)))})
