@@ -45,7 +45,8 @@
     "vpc_id" {:ident :aws-security-group/vpc-id :value-type :db.type/string}}
 
    "aws_security_group_rule"
-   {"from_port"                 {:ident :aws-security-group-rule/from-port :value-type :db.type/long}
+   {"id"                        {:ident :aws-security-group-rule/id :value-type :db.type/string}
+    "from_port"                 {:ident :aws-security-group-rule/from-port :value-type :db.type/long}
     "to_port"                   {:ident :aws-security-group-rule/to-port :value-type :db.type/long}
     "protocol"                  {:ident :aws-security-group-rule/protocol :value-type :db.type/string}
     "security_group_id"         {:ident :aws-security-group-rule/security-group-id :value-type :db.type/string}
@@ -570,24 +571,43 @@
   (into [] (comp (mapcat vals) (filter #(= :db.cardinality/many (:cardinality %))) (map :ident))
         (vals resource-schema)))
 
+(defn- new-many-values
+  "Map of cardinality-many modeled ident -> the set of values `attributes`
+  will assert for `type` (via `resource-attr-tx`, decomposed the same
+  way). Used by `resource-upsert-retractions` to avoid retracting a value
+  that's about to be re-asserted unchanged - Datomic rejects a
+  transaction that both retracts and asserts the exact same [entity
+  attribute value] datom."
+  [type attributes]
+  (let [{:keys [typed]} (decompose-attributes type attributes)]
+    (reduce (fn [m [ident value]] (update m ident (fnil conj #{}) value))
+            {}
+            typed)))
+
 (defn resource-upsert-retractions
   "Tx-data to retract before re-asserting a resource's decomposed
-  attributes on `POST`, so an upsert-in-place doesn't accumulate stale
-  datoms: every existing `:resource/attribute` sub-entity (whose retraction
-  cascades to its overflow chunks, being components), and every existing
-  value of every cardinality-many modeled attribute (so a shrunk/changed
-  set doesn't just grow). Cardinality-one modeled attributes need no
-  explicit retraction - asserting a new value for an existing entity/
-  attribute pair already retracts the old one. Returns `[]` if no resource
-  entity with `resource-id` currently exists (first-time POST)."
-  [db resource-id]
+  attributes on `POST` (or Sync), so an upsert-in-place doesn't
+  accumulate stale datoms: every existing `:resource/attribute`
+  sub-entity (whose retraction cascades to its overflow chunks, being
+  components), and every existing value of every cardinality-many
+  modeled attribute that `attributes` (this upsert's new value, decomposed
+  via `type`) won't itself re-assert (so a shrunk/changed set doesn't
+  just grow, while a value that's unchanged between upserts is neither
+  retracted nor re-asserted, avoiding a same-transaction retract+assert
+  conflict on it). Cardinality-one modeled attributes need no explicit
+  retraction - asserting a new value for an existing entity/attribute
+  pair already retracts the old one. Returns `[]` if no resource entity
+  with `resource-id` currently exists (first-time POST)."
+  [db resource-id type attributes]
   (if-let [eid (get (resource-id->eid db) resource-id)]
     (let [attr-eids        (map first (d/q '[:find ?a :in $ ?e :where [?e :resource/attribute ?a]] db eid))
           attr-retractions (mapv (fn [aeid] [:db/retractEntity aeid]) attr-eids)
+          new-values       (new-many-values type attributes)
           value-retractions (mapcat
                               (fn [ident]
-                                (map (fn [v] [:db/retract eid ident v])
-                                     (map first (d/q '[:find ?v :in $ ?e ?a :where [?e ?a ?v]] db eid ident))))
+                                (let [keep (get new-values ident #{})
+                                      existing (map first (d/q '[:find ?v :in $ ?e ?a :where [?e ?a ?v]] db eid ident))]
+                                  (map (fn [v] [:db/retract eid ident v]) (remove keep existing))))
                               many-modeled-idents)]
       (into attr-retractions value-retractions))
     []))

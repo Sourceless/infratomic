@@ -71,7 +71,7 @@
                      :resource/instance-meta  (instance-meta resource instance)
                      :resource/state-version  state-version-tempid}
                     (db/resource-attr-tx type attributes))]
-    (into [tx-map] (db/resource-upsert-retractions db id))))
+    (into [tx-map] (db/resource-upsert-retractions db id type attributes))))
 
 (defn- post-tx-data
   "Build the single transaction for a POST: a new state-version entity

@@ -180,6 +180,26 @@
         (is (= {"tags" {"Owner" "team-a"}}
                (attributes-of get-resp "uploads")))))))
 
+(deftest reposting-an-unchanged-cardinality-many-value-does-not-error
+  (testing "a cardinality-many modeled attribute whose value set is identical between two POSTs doesn't hit a Datomic same-transaction retract+assert conflict on the unchanged value(s)"
+    (let [conn (fresh-conn)
+          post! (fn [] (handler/post-state
+                        conn
+                        (state-body [(resource "aws_security_group_rule" "rule"
+                                                {"from_port"         22
+                                                 "to_port"            22
+                                                 "protocol"           "tcp"
+                                                 "security_group_id"  "sg-123"
+                                                 "cidr_blocks"        ["0.0.0.0/0"]})])))]
+      (post!)
+      (is (= 200 (:status (post!))))
+      (is (= {"from_port"         22
+              "to_port"            22
+              "protocol"           "tcp"
+              "security_group_id"  "sg-123"
+              "cidr_blocks"        ["0.0.0.0/0"]}
+             (attributes-of (handler/get-state conn) "rule"))))))
+
 (deftest oversized-attribute-value-does-not-block-persisting-the-resource
   (testing "one attribute value over the 4096-byte limit falls back to opaque storage without failing the transaction or affecting other attributes"
     (let [conn  (fresh-conn)

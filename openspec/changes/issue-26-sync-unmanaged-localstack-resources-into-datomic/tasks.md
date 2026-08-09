@@ -9,21 +9,21 @@
 
 ## 2. `aws_security_group_rule` id and AWS-shape translation
 
-- [ ] 2.1 Add a modeled `"id"` entry to `resource-schema`'s `"aws_security_group_rule"` map (`:aws-security-group-rule/id`, `:db.type/string`).
-- [ ] 2.2 Add `com.cognitect.aws/api`, `com.cognitect.aws/endpoints`, and `com.cognitect.aws/ec2` to `state-backend/deps.edn`.
-- [ ] 2.3 Add a function building an EC2 client pointed at LocalStack (`:endpoint-override {:protocol :http :hostname "localhost" :port 4566}`, static test credentials).
-- [ ] 2.4 Implement the AWS-response → Terraform-attribute-map translation function for `aws_security_group` (`DescribeSecurityGroups`) and `aws_security_group_rule` (`DescribeSecurityGroupRules`), per design.md's translation table.
-- [ ] 2.5 Implement the same for the remaining modeled types: `aws_vpc`, `aws_subnet`, `aws_route_table`, `aws_route` (including the synthesized `"<route_table_id>-<destination_cidr_block>"` id), `aws_route_table_association`, `aws_internet_gateway`, `aws_vpc_peering_connection`, `aws_instance`.
-- [ ] 2.6 Unit-test each translation function against a representative sample of that type's real EC2 API response shape.
+- [x] 2.1 Add a modeled `"id"` entry to `resource-schema`'s `"aws_security_group_rule"` map (`:aws-security-group-rule/id`, `:db.type/string`).
+- [x] 2.2 Add `com.cognitect.aws/api`, `com.cognitect.aws/endpoints`, and `com.cognitect.aws/ec2` to `state-backend/deps.edn`.
+- [x] 2.3 Add a function building an EC2 client pointed at LocalStack (`:endpoint-override {:protocol :http :hostname "localhost" :port 4566}`, static test credentials).
+- [x] 2.4 Implement the AWS-response → Terraform-attribute-map translation function for `aws_security_group` (`DescribeSecurityGroups`) and `aws_security_group_rule` (`DescribeSecurityGroupRules`), per design.md's translation table.
+- [x] 2.5 Implement the same for the remaining modeled types: `aws_vpc`, `aws_subnet`, `aws_route_table`, `aws_route` (including the synthesized `"<route_table_id>-<destination_cidr_block>"` id), `aws_route_table_association`, `aws_internet_gateway`, `aws_vpc_peering_connection`, `aws_instance`.
+- [x] 2.6 Unit-test each translation function against a representative sample of that type's real EC2 API response shape.
 
 ## 3. Sync matching and ingestion logic
 
-- [ ] 3.1 Add a new `infratomic.state-backend.sync` namespace.
-- [ ] 3.2 Implement a lookup function: given a resource type and its AWS resource id, find an existing Resource entity (if any) via a Datalog query on that type's modeled id ident (e.g. `:aws-security-group/id`), returning its `:resource/id` if found.
-- [ ] 3.3 Implement the per-resource ingestion decision: no existing match → build a tx-map with a synthesized `:resource/id` (`"<type>.discovered-<aws_id>"`), `:resource/type`, `:resource/managed? false`, and `(db/resource-attr-tx type attributes)`; existing match on a Discovered Resource → build the same tx-map but keyed by the existing `:resource/id` (update in place); existing match on a Terraform-managed resource → no tx-data (skip).
-- [ ] 3.4 Implement the full Sync pass: call every `Describe*` API from section 2, translate each result, run it through 3.2/3.3, and transact all resulting tx-data in one transaction.
-- [ ] 3.5 Implement a summary structure (discovered/updated/skipped-already-managed counts or lists) returned by the Sync pass, for the endpoint to serialize.
-- [ ] 3.6 Unit/integration-test: a brand-new LocalStack resource is ingested as discovered; a resource matching an existing Terraform-managed entity is skipped (not duplicated, `:resource/managed?` unchanged); running the full pass twice with no LocalStack changes produces no new entities on the second run and updates the existing Discovered Resource's attributes.
+- [x] 3.1 Add a new `infratomic.state-backend.sync` namespace.
+- [x] 3.2 Implement a lookup function: given a resource type and its AWS resource id, find an existing Resource entity (if any) via a Datalog query on that type's modeled id ident (e.g. `:aws-security-group/id`), returning its `:resource/id` if found.
+- [x] 3.3 Implement the per-resource ingestion decision: no existing match → build a tx-map with a synthesized `:resource/id` (`"<type>.discovered-<aws_id>"`), `:resource/type`, `:resource/managed? false`, and `(db/resource-attr-tx type attributes)`; existing match on a Discovered Resource → build the same tx-map but keyed by the existing `:resource/id` (update in place); existing match on a Terraform-managed resource → no tx-data (skip).
+- [x] 3.4 Implement the full Sync pass: call every `Describe*` API from section 2, translate each result, run it through 3.2/3.3, and transact all resulting tx-data in one transaction.
+- [x] 3.5 Implement a summary structure (discovered/updated/skipped-already-managed counts or lists) returned by the Sync pass, for the endpoint to serialize.
+- [x] 3.6 Unit/integration-test: a brand-new LocalStack resource is ingested as discovered; a resource matching an existing Terraform-managed entity is skipped (not duplicated, `:resource/managed?` unchanged); running the full pass twice with no LocalStack changes produces no new entities on the second run and updates the existing Discovered Resource's attributes.
 
 ## 4. `POST /sync` HTTP endpoint
 
