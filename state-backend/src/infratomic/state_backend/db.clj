@@ -91,7 +91,22 @@
    "aws_instance"
    {"id"                     {:ident :aws-instance/id :value-type :db.type/string}
     "subnet_id"              {:ident :aws-instance/subnet-id :value-type :db.type/string}
-    "vpc_security_group_ids" {:ident :aws-instance/vpc-security-group-id :value-type :db.type/string :cardinality :db.cardinality/many}}})
+    "vpc_security_group_ids" {:ident :aws-instance/vpc-security-group-id :value-type :db.type/string :cardinality :db.cardinality/many}}
+
+   "aws_iam_role"
+   {"id"   {:ident :aws-iam-role/id :value-type :db.type/string}
+    "name" {:ident :aws-iam-role/name :value-type :db.type/string}
+    "arn"  {:ident :aws-iam-role/arn :value-type :db.type/string}}
+
+   "aws_iam_policy"
+   {"arn" {:ident :aws-iam-policy/arn :value-type :db.type/string}}
+
+   "aws_s3_bucket"
+   {"arn" {:ident :aws-s3-bucket/arn :value-type :db.type/string}}
+
+   "aws_iam_role_policy_attachment"
+   {"role"       {:ident :aws-iam-role-policy-attachment/role :value-type :db.type/string}
+    "policy_arn" {:ident :aws-iam-role-policy-attachment/policy-arn :value-type :db.type/string}}})
 
 (defn- modeled-schema-entry
   [{:keys [ident value-type cardinality]}]
@@ -178,7 +193,40 @@
     {:db/ident       :overflow-chunk/value
      :db/valueType   :db.type/string
      :db/cardinality :db.cardinality/one
-     :db/doc         "One chunk (<=4096 bytes) of the parent attribute's JSON-encoded value."}]
+     :db/doc         "One chunk (<=4096 bytes) of the parent attribute's JSON-encoded value."}
+
+    ;; Scratch-only schema for `infratomic.state-backend.iam`'s query-time
+    ;; policy-statement fact derivation. These idents are transacted here
+    ;; (alongside the fixed schema, at `ensure-db!` time) so `d/with` has
+    ;; somewhere to assert derived statement facts, but no `:iam-statement/*`
+    ;; datom is ever written by `d/transact` - every value is asserted only
+    ;; into a scratch db built via `(d/with db {:tx-data ...})` inside
+    ;; `iam-reachable?`, never committed, never visible outside that one
+    ;; call. See docs/adr/0005-derive-iam-policy-facts-at-query-time-via-speculative-db.md.
+    {:db/ident       :iam-statement/effect
+     :db/valueType   :db.type/string
+     :db/cardinality :db.cardinality/one
+     :db/doc         "\"Allow\" or \"Deny\", as parsed from an IAM policy statement's `Effect` key. Scratch-only, see this schema section's preamble."}
+    {:db/ident       :iam-statement/action
+     :db/valueType   :db.type/string
+     :db/cardinality :db.cardinality/many
+     :db/doc         "The statement's `Action` values (normalized from either a bare string or an array), each an IAM action glob pattern (e.g. \"s3:GetObject\", \"s3:Get*\"). Scratch-only, see this schema section's preamble."}
+    {:db/ident       :iam-statement/resource
+     :db/valueType   :db.type/string
+     :db/cardinality :db.cardinality/many
+     :db/doc         "The statement's `Resource` values (normalized from either a bare string or an array), each an ARN glob pattern. Absent for a trust-policy statement, whose target is implicitly the role it's attached to. Scratch-only, see this schema section's preamble."}
+    {:db/ident       :iam-statement/principal
+     :db/valueType   :db.type/string
+     :db/cardinality :db.cardinality/many
+     :db/doc         "The statement's `Principal` values (flattened from a resource-based or trust policy's `Principal` map, e.g. `{\"AWS\": \"arn:...\"}`), each an ARN glob pattern (or a non-ARN identifier, e.g. a service principal, which simply never matches a resource's ARN). Absent for an identity-based statement, whose principal is implicitly the identity it's attached to. Scratch-only, see this schema section's preamble."}
+    {:db/ident       :iam-statement/source
+     :db/valueType   :db.type/ref
+     :db/cardinality :db.cardinality/one
+     :db/doc         "The already-persisted resource entity this statement's owning policy is attached to: the role for an identity-based or trust statement (including one reached via a managed policy attachment), or the target resource (e.g. a bucket) for a resource-based statement. Scratch-only, see this schema section's preamble."}
+    {:db/ident       :iam-statement/kind
+     :db/valueType   :db.type/keyword
+     :db/cardinality :db.cardinality/one
+     :db/doc         "`:identity`, `:resource`, or `:trust` - which side of an access grant this statement evaluates, so the `grants` rule can distinguish them without re-parsing. Scratch-only, see this schema section's preamble."}]
    modeled-schema))
 
 (defn storage-dir

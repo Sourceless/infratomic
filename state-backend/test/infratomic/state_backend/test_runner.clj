@@ -8,6 +8,7 @@
   it isn't hermetic like every other namespace here."
   (:require [clojure.test :as test]
             [infratomic.state-backend.handler-test]
+            [infratomic.state-backend.iam-test]
             [infratomic.state-backend.main-test]
             [infratomic.state-backend.policy-test]
             [infratomic.state-backend.query-test]
@@ -20,6 +21,7 @@
   composes with CI."
   [_]
   (let [{:keys [fail error]} (test/run-tests 'infratomic.state-backend.handler-test
+                                              'infratomic.state-backend.iam-test
                                               'infratomic.state-backend.main-test
                                               'infratomic.state-backend.policy-test
                                               'infratomic.state-backend.query-test

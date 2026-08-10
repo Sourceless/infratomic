@@ -1,0 +1,68 @@
+## Context
+
+See `proposal.md` for motivation. Key constraints from the existing codebase and the issue's alignment decisions (binding — this design implements them, not re-derives them):
+
+- Policy JSON (`aws_iam_role.assume_role_policy`, `aws_iam_role_policy.policy`, `aws_s3_bucket_policy.policy`, `aws_iam_policy.policy`) is stored today, and stays stored, as an opaque string via `db.clj`'s generic `:resource/attribute` key/value path — `resource-schema` (ADR-0003's mechanical extension point) gains no entries for policy content. This is a deliberate departure from #18/#20/#21's pattern of extending `resource-schema` for every join edge.
+- `policy.clj`'s `evaluate` already establishes the precedent for this repo's other `d/with`-speculative-db technique: build tx-data, `(d/with (d/with-db conn) {:tx-data ...})`, evaluate query functions against `:db-after`, never `d/transact`. That technique speculatively transacts a *plan's* not-yet-real resources. This change reuses the same primitive for a different purpose: deriving read-only *fact* datoms (parsed policy statements) from data that's already real and persisted, so a genuine recursive Datalog rule set has real datoms to traverse instead of walking parsed JSON in Clojure.
+- `query.clj`'s `reaches-rules`/`chain-rules` (network reachability) are the direct precedent for shape: a shared sub-rule var (`permission-rules`) factored out and reused across rule sets, a self clause, a polymorphic-target pattern. This change's `grants` rule follows the same shape but is unrelated in content (IAM, not network) and lives in its own namespace and own rule var — no sharing of Datomic idents or rule vars with `query.clj`.
+- No LocalStack IAM enforcement exists to cross-check against (LocalStack Community doesn't enforce IAM policy) — correctness rests entirely on the `grants` rule + fixtures matching real AWS IAM evaluation semantics as designed, per the issue's explicit acceptance criterion.
+
+## Goals / Non-Goals
+
+**Goals:**
+- Derive policy-statement facts from already-persisted, opaque policy JSON at query time only, into a scratch db that is never committed and never visible to any other query or endpoint.
+- Implement `iam-reachable?` as genuine recursive Datalog (the `grants` rule), matching the issue's explicit architectural acceptance criterion, including for the multi-hop role-assumption case.
+- Support full IAM glob matching (`*`/`?`) for actions/resources/principals, not exact-match only.
+- Keep the deny-override semantics correctly scoped (glob-matched to the same action/resource) rather than globally blocking, per alignment decision 5.
+
+**Non-Goals:**
+- Persisting derived policy-statement datoms, or extending `resource-schema` for policy content — explicitly rejected by the alignment decision.
+- Service control policies, permission boundaries, session policies, `aws_iam_user` principals — not requested by the acceptance criteria.
+- Verifying against real AWS/LocalStack IAM enforcement — self-modeled evaluation only, per the issue.
+- Composing IAM reachability with network reachability (e.g. "can this instance's role reach that bucket over the network AND via IAM") — named in research as a later possibility, not this issue's scope.
+
+## Decisions
+
+### Query-time fact derivation into a scratch `d/with` db, never persisted
+`iam-reachable?` takes the live `db` value (already reflecting persisted state — no plan involved, unlike `policy.clj`). It:
+1. Reads every resource whose type carries a policy-bearing attribute (`aws_iam_role.assume_role_policy`, `aws_iam_role_policy.policy`, `aws_s3_bucket_policy.policy`, `aws_iam_policy.policy` + its `aws_iam_role_policy_attachment` rows, using `query/resources-by-type` and the existing generic-attribute reconstruction already in `db.clj` to recover the raw JSON string).
+2. Parses each policy JSON document into its statements (`Effect`, `Action` — normalized to a set, since IAM allows a bare string or an array —, `Resource`, `Principal`), and builds a vector of derived-fact tx-maps: one temporary entity per statement, carrying scratch-only idents (e.g. `:iam-statement/effect`, `:iam-statement/action`, `:iam-statement/resource`, `:iam-statement/principal`, `:iam-statement/source` — a ref back to the owning resource entity, and `:iam-statement/kind` — `:identity`, `:resource`, or `:trust`, so the `grants` rule can distinguish an identity-side statement from a resource-side one without re-parsing).
+3. Transacts those derived facts via `(d/with db {:tx-data ...})` — never `d/transact`, so nothing is ever visible outside this one call — and runs the `grants` Datalog rule against the resulting `:db-after`, which now has both the original persisted resource/relationship datoms (roles, buckets, attachments, ARNs) and the freshly derived statement facts to join against.
+4. Returns a boolean, exactly like `reachable?`/`reachable-within-hops?`.
+
+This mirrors `policy.clj`'s `d/with` technique in mechanism only — the two never share code, since one derives facts from a plan and the other derives facts from already-real state for a read query, and the scratch schema idents (`:iam-statement/*`) are declared once as ordinary `db.clj`-style schema entries, transacted alongside the fixed schema at `ensure-db!` time so `d/with` can assert them, but the *values* are always speculative — no `:iam-statement/*` datom is ever written by `d/transact`.
+
+**Alternative considered**: parse policy JSON and walk the resulting Clojure data structures directly (an application-level graph walk), avoiding Datomic rules entirely. Rejected — this is exactly what the issue's acceptance criterion ("traversal is recursive Datalog, not an application-level graph walk in Clojure") rules out.
+
+**Alternative considered**: persist decomposed policy statements as ordinary schema-mapped datoms via `resource-schema`, mirroring #18/#20's pattern. Rejected per the alignment decision — policy JSON's statement structure is qualitatively different from every other modeled attribute (parsing embedded JSON at write time, not just flattening Terraform-native maps/vectors), and persisting derived data that's trivially re-derivable from data already stored adds write-path complexity and staleness risk for no read-path benefit once query-time `d/with` derivation works.
+
+### The `grants` rule: one mechanism for direct access and role assumption
+A single recursive rule, `grants ?principal ?action ?resource`, evaluates:
+- **Identity-side allow**: an identity-based statement (kind `:identity`, sourced from a policy attached to `?principal` — inline `aws_iam_role_policy` or via `aws_iam_role_policy_attachment` to an `aws_iam_policy`) with `Effect: Allow` whose `Action`/`Resource` glob-match the query's `?action`/`?resource`.
+- **Resource-side allow**: a resource-based statement (kind `:resource`, sourced from the target's own resource-based policy, e.g. `aws_s3_bucket_policy`) with `Effect: Allow` whose `Action`/`Resource`/`Principal` glob-match.
+- **Scoped deny-override**: neither an identity-side nor resource-side statement with `Effect: Deny` glob-matching the same `?action`/`?resource`(/`?principal`) exists — checked as a negation (`not-join` in Datomic rule syntax) scoped to statements matching that specific action/resource, never a blanket "any deny exists" check.
+- **Role-assumption edge**: `grants` also matches when `?resource` is itself an `aws_iam_role` entity (the assumed role) and `?action` is `"sts:AssumeRole"` — evaluated with the *assumed* role's trust policy as the resource-side statement (kind `:trust`, `Action: sts:AssumeRole`) and the *assuming* role's own identity policy as the identity-side statement, using the exact same allow/deny logic above. No separate trust-policy-only code path exists.
+- **Recursive resource-access-via-assumed-role clause**: `grants ?principal ?action ?resource` also holds when `?principal` `grants`(recursively) `"sts:AssumeRole"` on some intermediate role `?mid`, and `?mid` `grants` `?action` on `?resource` — this is the self-referential recursion that lets a chain of more than one assumed role work without hand-unrolling hops, mirroring `chain-rules`'s guard/recurse shape (here the base case is direct identity/resource allow, not a counter — role-assumption chains are naturally finite since they're bounded by the number of `aws_iam_role` entities that exist, so no explicit hop-counter is needed the way `reachable-within-hops?` needed one for potentially-cyclic peering topology).
+
+**Alternative considered**: a separate `assumes?` rule plus application-level chaining in Clojure (call `iam-reachable?` once per hop). Rejected per the alignment decision — trust policies are modeled as ordinary resource-based policies specifically so one `grants` rule handles both real access and role assumption, and the recursion needs to be genuine Datalog self-reference to satisfy the issue's architectural acceptance criterion for the multi-hop case, not app-level looping.
+
+### Glob matching as a Datalog predicate clause
+IAM's `*`/`?` wildcard semantics are implemented as a pure `(fn [pattern value] -> boolean)` predicate (glob compiled to an anchored regex: `*` → `.*`, `?` → `.`, everything else literal-escaped), invoked from `grants`'s rule body as a Datomic predicate clause (`[(iam/glob-matches? ?pattern ?value)]`), not as a value-equality join. This lets a statement's `Action: "s3:Get*"` or `Resource: "arn:aws:s3:::my-bucket/*"` match the query's concrete `?action`/`?resource` string without enumerating every possible action/resource pair.
+
+### ARN resolution uses Terraform's own computed `arn` attribute
+Principal- and resource-matching in policy statements (e.g. `Resource: "arn:aws:s3:::my-bucket"`, `Principal: {"AWS": "arn:aws:iam::000000000000:role/source-role"}`) is done by joining against each resource's own `arn` Terraform state attribute (`aws_iam_role.arn`, `aws_iam_policy.arn`, `aws_s3_bucket.arn`) — which becomes a small, ordinary modeled `resource-schema` entry per type (this *is* an existing-pattern schema addition; only policy *content* stays unmodeled) — rather than constructing ARNs from account id and region in code. Avoids hardcoding LocalStack's dummy account id (`000000000000`) anywhere in the query layer.
+
+### Function signature and scoping
+`iam-reachable? db principal resource action` — `principal` and `resource` are `:resource/id` strings (e.g. `"aws_iam_role.source"`, `"aws_s3_bucket.data"`), `action` is an IAM action string (e.g. `"s3:GetObject"`). An explicit action parameter is required (unlike `reachable?`, which has no action concept) because deny-override cannot be meaningfully scoped to "the same action/resource" without one.
+
+### New namespace, new ADR
+`infratomic.state-backend.iam` holds all of this — JSON parsing, glob matching, scratch-db assembly, the `grants` rule, and `iam-reachable?` — kept separate from `query.clj` (pure Datalog querying over already-typed data) and `policy.clj` (plan-time speculative evaluation of a different kind of input). The core rule is named `grants`, avoiding any collision with `reaches`/`chain-reaches`.
+
+An ADR is added at `docs/adr/0005-derive-iam-policy-facts-at-query-time-via-speculative-db.md` (0004 is already taken by the plan-time Address Stand-in ADR) documenting the query-time `d/with` fact-derivation technique, the glob-matching predicate, and the trust-policy-as-resource-based-policy unification — each is hard to reverse, non-obvious to a future reader, and the result of a real trade-off against persisting decomposed statements.
+
+## Risks / Trade-offs
+
+- **Query-time JSON parsing on every `iam-reachable?` call is non-trivial work** (parse every policy-bearing resource's JSON, on every call, with no caching) → Acceptable for this issue's scope: correctness and architectural honesty (real recursive Datalog, no persisted derived data) matter more than query latency here; a caching layer is a natural, non-breaking future addition if needed, not a concern for this change.
+- **Glob-to-regex translation is a common source of subtle bugs** (e.g. mishandling regex metacharacters in the literal portions of a pattern, or `?` matching zero characters instead of exactly one) → Mitigated by keeping the predicate as one small, directly-tested pure function, and by the deny-override test scenario specifically exercising a glob match, not just literal equality.
+- **Deny-override scope is the easiest part to get subtly wrong** (flagged in research: accidentally scoping the deny search to only the identity-side policy rather than the full identity+resource+assumption-chain path, or accidentally making it a global "any deny blocks everything" check) → Mitigated by dedicated positive (deny blocks matching access) and negative (unrelated deny doesn't block) test scenarios in the spec, and by deriving deny-checking from the same glob-match predicate used for allow-matching, so there's only one matching mechanism to get right.
+- **Role-assumption recursion needs a real termination argument even without an explicit hop counter** — relies on `aws_iam_role` entities being finite and the recursion only ever proceeding through distinct `grants ?principal "sts:AssumeRole" ?mid` edges, which Datomic's rule evaluation handles like any other recursive rule (as already proven safe by `chain-rules`'s `vpc-chain-reaches`) → Mitigated by keeping fixture role-assumption chains acyclic (matching real-world usage; AWS trust policies that formed a cycle would be a misconfiguration, not a case this issue's acceptance criteria ask to handle) and by not overclaiming cycle-safety in the spec.
