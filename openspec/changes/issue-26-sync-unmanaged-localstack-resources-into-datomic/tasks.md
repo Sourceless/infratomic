@@ -33,9 +33,9 @@
 
 ## 5. CLI `sync` subcommand
 
-- [ ] 5.1 Add a `--sync-url`/`INFRATOMIC_SYNC_URL` config point to `cli/main.clj`, defaulting to the sample app's local State Backend address, mirroring the existing `--policy-check-url`/`INFRATOMIC_POLICY_CHECK_URL` pattern.
-- [ ] 5.2 Add `sync` subcommand handling in `-main`: `POST` an empty body to the Sync URL and parse the JSON response.
-- [ ] 5.3 Print a human-readable summary of discovered/updated resources on success; on a non-`200`/malformed/failed response, print an error and exit non-zero (fail closed, matching `apply-gated!`'s error handling style).
+- [x] 5.1 Add a `--sync-url`/`INFRATOMIC_SYNC_URL` config point to `cli/main.clj`, defaulting to the sample app's local State Backend address, mirroring the existing `--policy-check-url`/`INFRATOMIC_POLICY_CHECK_URL` pattern.
+- [x] 5.2 Add `sync` subcommand handling in `-main`: `POST` an empty body to the Sync URL and parse the JSON response.
+- [x] 5.3 Print a human-readable summary of discovered/updated resources on success; on a non-`200`/malformed/failed response, print an error and exit non-zero (fail closed, matching `apply-gated!`'s error handling style).
 
 ## 6. End-to-end verification against the sample app
 
