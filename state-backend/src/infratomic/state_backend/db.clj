@@ -45,7 +45,8 @@
     "vpc_id" {:ident :aws-security-group/vpc-id :value-type :db.type/string}}
 
    "aws_security_group_rule"
-   {"from_port"                 {:ident :aws-security-group-rule/from-port :value-type :db.type/long}
+   {"id"                        {:ident :aws-security-group-rule/id :value-type :db.type/string}
+    "from_port"                 {:ident :aws-security-group-rule/from-port :value-type :db.type/long}
     "to_port"                   {:ident :aws-security-group-rule/to-port :value-type :db.type/long}
     "protocol"                  {:ident :aws-security-group-rule/protocol :value-type :db.type/string}
     "security_group_id"         {:ident :aws-security-group-rule/security-group-id :value-type :db.type/string}
@@ -145,7 +146,11 @@
      :db/valueType   :db.type/string
      :db/cardinality :db.cardinality/one
      :db/unique      :db.unique/identity
-     :db/doc         "Unique identifier for a resource, computed as \"type.name\"."}
+     :db/doc         "Unique identifier for a resource, computed as \"type.name\" for a Terraform-managed resource, or \"type.discovered-<aws_id>\" for a Discovered Resource."}
+    {:db/ident       :resource/managed?
+     :db/valueType   :db.type/boolean
+     :db/cardinality :db.cardinality/one
+     :db/doc         "true for a Terraform-managed resource (set by resource->tx on the POST /state path); false for a Discovered Resource (set by Sync). Read by GET /state reconstruction and stale-resource-retractions to exclude Discovered Resources from what Terraform is told it owns and from the stale-sweep."}
     {:db/ident       :resource/type
      :db/valueType   :db.type/string
      :db/cardinality :db.cardinality/one
@@ -241,13 +246,41 @@
               :system      "infratomic"
               :storage-dir dir})))
 
+(defn- untagged-resource-eids
+  "Entity ids of every resource entity with no `:resource/managed?` value
+  yet - i.e. every resource that predates that attribute. Every one of
+  these was written before Sync (and Discovered Resources) existed, so by
+  definition every one of them is Terraform-managed (see ADR-0005)."
+  [db]
+  (map first (d/q '[:find ?e
+                     :where
+                     [?e :resource/id]
+                     (not [?e :resource/managed? _])]
+                   db)))
+
+(defn backfill-managed-flag!
+  "One-time, idempotent migration step: tag every resource entity that
+  predates `:resource/managed?` as Terraform-managed (`true`). Runs on
+  every `ensure-db!` call (i.e. every process start), but after the first
+  run post-deploy the query above finds nothing, making every subsequent
+  call a no-op (see ADR-0005 and design.md's Migration Plan). Public
+  (rather than `defn-`) so it's directly testable against an isolated
+  test db, mirroring `ensure-db!`'s own step."
+  [conn]
+  (let [eids (untagged-resource-eids (d/db conn))]
+    (when (seq eids)
+      (d/transact conn {:tx-data (mapv (fn [eid] [:db/add eid :resource/managed? true]) eids)}))))
+
 (defn ensure-db!
-  "Create the database if it doesn't already exist, connect, and ensure the
-  schema is transacted. Idempotent - safe to call on every startup."
+  "Create the database if it doesn't already exist, connect, ensure the
+  schema is transacted, and backfill `:resource/managed? true` onto any
+  resource entity written before that attribute existed. Idempotent - safe
+  to call on every startup."
   [client]
   (d/create-database client {:db-name db-name})
   (let [conn (d/connect client {:db-name db-name})]
     (d/transact conn {:tx-data schema})
+    (backfill-managed-flag! conn)
     conn))
 
 ;; ---------------------------------------------------------------------------
@@ -518,18 +551,36 @@
                     db max-tx)))))
 
 (defn all-resource-eids
-  "All resource entity ids currently in the database."
+  "All resource entity ids currently in the database, Terraform-managed and
+  Discovered alike."
   [db]
   (map first (d/q '[:find ?e :where [?e :resource/id]] db)))
 
+(defn managed-resource-eids
+  "Entity ids of every Terraform-managed (`:resource/managed? true`)
+  resource currently in the database - excludes Discovered Resources.
+  Used by `GET /state` reconstruction, which must never tell Terraform it
+  owns a Discovered Resource."
+  [db]
+  (map first (d/q '[:find ?e :where [?e :resource/managed? true]] db)))
+
 (defn resource-id->eid
   "Map of `:resource/id` -> entity id for every resource entity currently in
-  the database. Used by `POST` to find resources that are in the database
-  but no longer present in the newly posted state (e.g. destroyed/removed
-  resources), so their stale entities can be retracted, and to find a
+  the database, Terraform-managed and Discovered alike. Used to find a
   resource's existing entity (if any) when upserting its attributes."
   [db]
   (into {} (d/q '[:find ?id ?e :where [?e :resource/id ?id]] db)))
+
+(defn managed-resource-id->eid
+  "Map of `:resource/id` -> entity id for every Terraform-managed
+  (`:resource/managed? true`) resource currently in the database -
+  excludes Discovered Resources. Used by `POST` to find resources that are
+  in the database but no longer present in the newly posted state (e.g.
+  destroyed/removed resources), so their stale entities can be retracted -
+  a Discovered Resource is never a candidate for this retraction,
+  regardless of whether it's mentioned in the posted body."
+  [db]
+  (into {} (d/q '[:find ?id ?e :where [?e :resource/id ?id] [?e :resource/managed? true]] db)))
 
 (def ^:private modeled-idents
   (into [] (comp (mapcat vals) (map :ident)) (vals resource-schema)))
@@ -543,10 +594,18 @@
 (defn all-resources
   "Pull `:resource/type`, `:resource/name`, `:resource/instance-meta`, every
   modeled attribute, and every generic `:resource/attribute` sub-entity for
-  every resource entity currently in the database. Used by `GET` to
-  reconstruct a state document's `resources[]`."
+  every resource entity currently in the database, Terraform-managed and
+  Discovered alike."
   [db]
   (map #(d/pull db resource-pull-pattern %) (all-resource-eids db)))
+
+(defn managed-resources
+  "Like `all-resources`, but limited to Terraform-managed
+  (`:resource/managed? true`) resources - excludes Discovered Resources.
+  Used by `GET` to reconstruct a state document's `resources[]`, so
+  Terraform is never told it owns a Discovered Resource."
+  [db]
+  (map #(d/pull db resource-pull-pattern %) (managed-resource-eids db)))
 
 (defn all-state-version-eids
   "All state-version entity ids currently in the database. `DELETE` needs to
@@ -560,24 +619,43 @@
   (into [] (comp (mapcat vals) (filter #(= :db.cardinality/many (:cardinality %))) (map :ident))
         (vals resource-schema)))
 
+(defn- new-many-values
+  "Map of cardinality-many modeled ident -> the set of values `attributes`
+  will assert for `type` (via `resource-attr-tx`, decomposed the same
+  way). Used by `resource-upsert-retractions` to avoid retracting a value
+  that's about to be re-asserted unchanged - Datomic rejects a
+  transaction that both retracts and asserts the exact same [entity
+  attribute value] datom."
+  [type attributes]
+  (let [{:keys [typed]} (decompose-attributes type attributes)]
+    (reduce (fn [m [ident value]] (update m ident (fnil conj #{}) value))
+            {}
+            typed)))
+
 (defn resource-upsert-retractions
   "Tx-data to retract before re-asserting a resource's decomposed
-  attributes on `POST`, so an upsert-in-place doesn't accumulate stale
-  datoms: every existing `:resource/attribute` sub-entity (whose retraction
-  cascades to its overflow chunks, being components), and every existing
-  value of every cardinality-many modeled attribute (so a shrunk/changed
-  set doesn't just grow). Cardinality-one modeled attributes need no
-  explicit retraction - asserting a new value for an existing entity/
-  attribute pair already retracts the old one. Returns `[]` if no resource
-  entity with `resource-id` currently exists (first-time POST)."
-  [db resource-id]
+  attributes on `POST` (or Sync), so an upsert-in-place doesn't
+  accumulate stale datoms: every existing `:resource/attribute`
+  sub-entity (whose retraction cascades to its overflow chunks, being
+  components), and every existing value of every cardinality-many
+  modeled attribute that `attributes` (this upsert's new value, decomposed
+  via `type`) won't itself re-assert (so a shrunk/changed set doesn't
+  just grow, while a value that's unchanged between upserts is neither
+  retracted nor re-asserted, avoiding a same-transaction retract+assert
+  conflict on it). Cardinality-one modeled attributes need no explicit
+  retraction - asserting a new value for an existing entity/attribute
+  pair already retracts the old one. Returns `[]` if no resource entity
+  with `resource-id` currently exists (first-time POST)."
+  [db resource-id type attributes]
   (if-let [eid (get (resource-id->eid db) resource-id)]
     (let [attr-eids        (map first (d/q '[:find ?a :in $ ?e :where [?e :resource/attribute ?a]] db eid))
           attr-retractions (mapv (fn [aeid] [:db/retractEntity aeid]) attr-eids)
+          new-values       (new-many-values type attributes)
           value-retractions (mapcat
                               (fn [ident]
-                                (map (fn [v] [:db/retract eid ident v])
-                                     (map first (d/q '[:find ?v :in $ ?e ?a :where [?e ?a ?v]] db eid ident))))
+                                (let [keep (get new-values ident #{})
+                                      existing (map first (d/q '[:find ?v :in $ ?e ?a :where [?e ?a ?v]] db eid ident))]
+                                  (map (fn [v] [:db/retract eid ident v]) (remove keep existing))))
                               many-modeled-idents)]
       (into attr-retractions value-retractions))
     []))

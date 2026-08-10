@@ -22,10 +22,17 @@
       conn)))
 
 (deftest policy-check-with-a-non-post-method-is-405-not-404
-  (let [handler (main/app-handler (fresh-conn))]
+  (let [handler (main/app-handler (fresh-conn) nil)]
     (is (= 405 (:status (handler {:request-method :get :uri "/policy-check"}))))
     (is (= 405 (:status (handler {:request-method :delete :uri "/policy-check"}))))))
 
+(deftest sync-with-a-non-post-method-is-405-not-404
+  ;; nil ec2-client is safe here - sync/sync-endpoint (which would need a
+  ;; real client) is never reached for a non-POST method.
+  (let [handler (main/app-handler (fresh-conn) nil)]
+    (is (= 405 (:status (handler {:request-method :get :uri "/sync"}))))
+    (is (= 405 (:status (handler {:request-method :delete :uri "/sync"}))))))
+
 (deftest unknown-uri-still-404s
-  (let [handler (main/app-handler (fresh-conn))]
+  (let [handler (main/app-handler (fresh-conn) nil)]
     (is (= 404 (:status (handler {:request-method :get :uri "/nope"}))))))

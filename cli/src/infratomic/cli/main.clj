@@ -3,9 +3,13 @@
   args...>`): a drop-in replacement for the `terraform` binary that passes
   every subcommand straight through unchanged except `apply`, which it
   intercepts to run a Policy Check - via the State Backend's `POST
-  /policy-check` endpoint - before ever invoking real `terraform apply`.
-  See openspec/changes/issue-16-block-bad-infra-states-before-terraform-
-  apply-runs/design.md's \"CLI structure\" decision.
+  /policy-check` endpoint - before ever invoking real `terraform apply`,
+  and `sync`, a State-Backend-only subcommand (not a real Terraform one)
+  that triggers Sync - via `POST /sync` - and prints a summary of what it
+  discovered/ingested. See openspec/changes/issue-16-block-bad-infra-
+  states-before-terraform-apply-runs/design.md's \"CLI structure\"
+  decision, and openspec/changes/issue-26-sync-unmanaged-localstack-
+  resources-into-datomic/design.md's \"CLI sync subcommand\" decision.
 
   Passthrough subcommands shell out to the real `terraform` binary with
   `ProcessBuilder`, inheriting stdio, so interactive prompts, colored
@@ -27,6 +31,11 @@
   State Backend address (see `state-backend/src/infratomic/state_backend
   /main.clj`'s `port`)."
   "http://localhost:8080/policy-check")
+
+(def ^:private default-sync-url
+  "The Sync endpoint's default base URL - the sample app's local State
+  Backend address, mirroring `default-policy-check-url`."
+  "http://localhost:8080/sync")
 
 (defn- subcommand
   "The first non-flag (doesn't start with `-`) argument in `args` - the
@@ -145,6 +154,65 @@
               :else
               (terraform! ["apply" "tfplan"]))))))))
 
+(defn- print-discovered-resource
+  [{:strs [type id]}]
+  (println (format "  - %s (%s)" id type)))
+
+(defn- trigger-sync
+  "POST an empty body to `sync-url` and return either `{:discovered [...]
+  :updated [...] :skipped-already-managed N}` for a positively confirmed
+  response, or `{:error <message>}` for anything else - a non-`200`
+  status, a response body that doesn't parse as JSON, a parsed body
+  missing the expected `discovered`/`updated` arrays, or the HTTP request
+  itself failing (e.g. connection refused). Fail-closed like
+  `policy-check`: only a `200` response with the expected shape is ever
+  treated as a confirmed result, so a malformed or non-2xx response from
+  the Sync endpoint is reported as a failure rather than silently treated
+  as \"nothing discovered\"."
+  [sync-url]
+  (try
+    (let [{:keys [status body]} (post-json sync-url "")]
+      (if (not= 200 status)
+        {:error (format "Sync endpoint returned HTTP %d: %s" status body)}
+        (let [parsed (try (json/parse-string body) (catch Exception _ ::invalid))]
+          (cond
+            (= parsed ::invalid)
+            {:error (format "Sync endpoint returned a response that isn't valid JSON: %s" body)}
+
+            (not (and (sequential? (get parsed "discovered")) (sequential? (get parsed "updated"))))
+            {:error (format "Sync endpoint response has no `discovered`/`updated` arrays: %s" body)}
+
+            :else
+            {:discovered              (get parsed "discovered")
+             :updated                 (get parsed "updated")
+             :skipped-already-managed (get parsed "skipped_already_managed")}))))
+    (catch Exception e
+      {:error (format "Sync request to %s failed: %s" sync-url (.getMessage e))})))
+
+(defn- sync!
+  "The `sync` subcommand's full flow: trigger Sync (`trigger-sync`) and
+  print either a human-readable summary of what it discovered/updated, or
+  an error - exiting non-zero on any failure (fail closed, matching
+  `apply-gated!`'s error handling style) rather than silently reporting
+  success. Returns the exit code the CLI process should exit with."
+  [sync-url]
+  (let [{:keys [discovered updated skipped-already-managed error]} (trigger-sync sync-url)]
+    (if error
+      (do
+        (println "Sync failed:")
+        (println (str "  " error))
+        1)
+      (do
+        (println (format "Sync complete: %d discovered, %d updated, %d already managed (skipped)"
+                          (count discovered) (count updated) (or skipped-already-managed 0)))
+        (when (seq discovered)
+          (println "Discovered:")
+          (doseq [resource discovered] (print-discovered-resource resource)))
+        (when (seq updated)
+          (println "Updated:")
+          (doseq [resource updated] (print-discovered-resource resource)))
+        0))))
+
 (defn- flag-value
   [args flag]
   (some (fn [arg] (when (str/starts-with? arg (str flag "=")) (subs arg (inc (count flag)))))
@@ -162,8 +230,19 @@
         policy-check-url (or (flag-value args "--policy-check-url")
                               (System/getenv "INFRATOMIC_POLICY_CHECK_URL")
                               default-policy-check-url)
-        tf-args          (remove #(str/starts-with? % "--policy-check-url=") args)
-        exit             (if (= "apply" (subcommand tf-args))
+        sync-url         (or (flag-value args "--sync-url")
+                              (System/getenv "INFRATOMIC_SYNC_URL")
+                              default-sync-url)
+        tf-args          (remove #(or (str/starts-with? % "--policy-check-url=")
+                                       (str/starts-with? % "--sync-url="))
+                                  args)
+        exit             (cond
+                            (= "apply" (subcommand tf-args))
                             (apply-gated! policy-check-url (rest (drop-while #(not= % "apply") tf-args)))
+
+                            (= "sync" (subcommand tf-args))
+                            (sync! sync-url)
+
+                            :else
                             (terraform! tf-args))]
     (System/exit exit)))

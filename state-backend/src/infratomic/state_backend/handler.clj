@@ -67,10 +67,11 @@
                     {:resource/id             id
                      :resource/type           type
                      :resource/name           (get resource "name")
+                     :resource/managed?       true
                      :resource/instance-meta  (instance-meta resource instance)
                      :resource/state-version  state-version-tempid}
                     (db/resource-attr-tx type attributes))]
-    (into [tx-map] (db/resource-upsert-retractions db id))))
+    (into [tx-map] (db/resource-upsert-retractions db id type attributes))))
 
 (defn- post-tx-data
   "Build the single transaction for a POST: a new state-version entity
@@ -97,10 +98,14 @@
   no longer present in `parsed`'s managed `resources[]` - i.e. resources
   destroyed or otherwise removed from Terraform's state since the last
   `POST`. Without this, `GET`/`terraform state list` would keep serving
-  \"ghost\" resources indefinitely, since `resource->tx` only ever upserts."
+  \"ghost\" resources indefinitely, since `resource->tx` only ever upserts.
+  Only Terraform-managed resources are candidates for retraction here - a
+  Discovered Resource is never in `db/managed-resource-id->eid`'s result,
+  so it's never retracted, regardless of whether it's mentioned in the
+  posted body (see ADR-0005)."
   [db parsed]
   (let [posted-ids (into #{} (map resource-id) (managed-resources parsed))
-        existing   (db/resource-id->eid db)
+        existing   (db/managed-resource-id->eid db)
         stale-eids (vals (apply dissoc existing posted-ids))]
     (mapv (fn [eid] [:db/retractEntity eid]) stale-eids)))
 
@@ -135,11 +140,13 @@
 
 (defn- reconstruct-state
   "Build a Terraform-state-JSON document from the latest state-version
-  entity and the current resource entities. Not byte-identical to what was
-  last posted, but semantically equivalent for Terraform's client, which
-  parses this structurally rather than diffing it - verified empirically
-  against the real sample app (no `terraform plan` drift after a service
-  restart)."
+  entity and the current Terraform-managed resource entities - a
+  Discovered Resource entity (ingested by Sync) is never included, since
+  Terraform never created it and must not be told it owns it (see
+  ADR-0005). Not byte-identical to what was last posted, but semantically
+  equivalent for Terraform's client, which parses this structurally rather
+  than diffing it - verified empirically against the real sample app (no
+  `terraform plan` drift after a service restart)."
   [db sv-eid]
   (let [sv (d/pull db [:state-version/version
                         :state-version/terraform-version
@@ -152,7 +159,7 @@
      "serial"            (:state-version/serial sv)
      "lineage"           (:state-version/lineage sv)
      "outputs"           (json/parse-string (:state-version/outputs sv))
-     "resources"         (mapv resource-entry (db/all-resources db))}))
+     "resources"         (mapv resource-entry (db/managed-resources db))}))
 
 (defn get-state
   [conn]

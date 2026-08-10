@@ -12,7 +12,9 @@
             [infratomic.state-backend.main-test]
             [infratomic.state-backend.policy-test]
             [infratomic.state-backend.query-test]
-            [infratomic.state-backend.query-integration-test]))
+            [infratomic.state-backend.query-integration-test]
+            [infratomic.state-backend.sync-test]
+            [infratomic.state-backend.sync-integration-test]))
 
 (defn run-tests
   "Run the hermetic test suite and exit non-zero on failure/error, so this
@@ -22,13 +24,15 @@
                                               'infratomic.state-backend.iam-test
                                               'infratomic.state-backend.main-test
                                               'infratomic.state-backend.policy-test
-                                              'infratomic.state-backend.query-test)]
+                                              'infratomic.state-backend.query-test
+                                              'infratomic.state-backend.sync-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))
 
 (defn run-integration-tests
-  "Run just `query-integration-test` and exit non-zero on failure/error.
-  Assumes LocalStack + the State Backend dev server are already running
-  (see that namespace's docstring)."
+  "Run `query-integration-test` and `sync-integration-test` and exit
+  non-zero on failure/error. Assumes LocalStack + the State Backend dev
+  server are already running (see each namespace's docstring)."
   [_]
-  (let [{:keys [fail error]} (test/run-tests 'infratomic.state-backend.query-integration-test)]
+  (let [{:keys [fail error]} (test/run-tests 'infratomic.state-backend.query-integration-test
+                                              'infratomic.state-backend.sync-integration-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))

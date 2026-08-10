@@ -180,6 +180,26 @@
         (is (= {"tags" {"Owner" "team-a"}}
                (attributes-of get-resp "uploads")))))))
 
+(deftest reposting-an-unchanged-cardinality-many-value-does-not-error
+  (testing "a cardinality-many modeled attribute whose value set is identical between two POSTs doesn't hit a Datomic same-transaction retract+assert conflict on the unchanged value(s)"
+    (let [conn (fresh-conn)
+          post! (fn [] (handler/post-state
+                        conn
+                        (state-body [(resource "aws_security_group_rule" "rule"
+                                                {"from_port"         22
+                                                 "to_port"            22
+                                                 "protocol"           "tcp"
+                                                 "security_group_id"  "sg-123"
+                                                 "cidr_blocks"        ["0.0.0.0/0"]})])))]
+      (post!)
+      (is (= 200 (:status (post!))))
+      (is (= {"from_port"         22
+              "to_port"            22
+              "protocol"           "tcp"
+              "security_group_id"  "sg-123"
+              "cidr_blocks"        ["0.0.0.0/0"]}
+             (attributes-of (handler/get-state conn) "rule"))))))
+
 (deftest oversized-attribute-value-does-not-block-persisting-the-resource
   (testing "one attribute value over the 4096-byte limit falls back to opaque storage without failing the transaction or affecting other attributes"
     (let [conn  (fresh-conn)
@@ -189,3 +209,54 @@
        (state-body [(resource "aws_s3_bucket" "uploads" {"bucket" "small" "policy" huge})]))
       (is (= {"bucket" "small" "policy" huge}
              (attributes-of (handler/get-state conn) "uploads"))))))
+
+;; ---------------------------------------------------------------------------
+;; :resource/managed? tagging and read-path filters (issue #26)
+;; ---------------------------------------------------------------------------
+
+(defn- discovered-resource-tx
+  "A minimal Discovered Resource entity tx-map, as Sync would transact -
+  `:resource/managed? false`, a synthesized discovered-style `:resource/id`."
+  [type aws-id]
+  {:resource/id       (str type ".discovered-" aws-id)
+   :resource/type     type
+   :resource/managed? false})
+
+(deftest posted-resource-is-tagged-managed
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_s3_bucket" "uploads")]))
+    (let [db (d/db conn)]
+      (is (= true (:resource/managed? (d/pull db [:resource/managed?] [:resource/id "aws_s3_bucket.uploads"])))))))
+
+(deftest discovered-resource-is-excluded-from-get
+  (testing "a :resource/managed? false entity never appears in GET /state, even alongside managed resources"
+    (let [conn (fresh-conn)]
+      (handler/post-state conn (state-body [(resource "aws_s3_bucket" "uploads")]))
+      (d/transact conn {:tx-data [(discovered-resource-tx "aws_security_group" "sg-999")]})
+      (is (= #{"aws_s3_bucket.uploads"} (resource-ids (handler/get-state conn)))))))
+
+(deftest discovered-resource-survives-a-post-that-does-not-mention-it
+  (testing "POST's stale-resource retraction sweep never retracts a Discovered Resource"
+    (let [conn (fresh-conn)]
+      (handler/post-state conn (state-body [(resource "aws_s3_bucket" "uploads")]))
+      (d/transact conn {:tx-data [(discovered-resource-tx "aws_security_group" "sg-999")]})
+      ;; A subsequent POST that doesn't mention the Discovered Resource at all.
+      (handler/post-state conn (state-body [(resource "aws_s3_bucket" "uploads")]))
+      (let [db (d/db conn)]
+        (is (some? (d/pull db [:resource/id] [:resource/id "aws_security_group.discovered-sg-999"])))))))
+
+(deftest backfill-tags-pre-existing-untagged-entities-and-is-idempotent
+  (testing "db/backfill-managed-flag! (the step ensure-db! runs on every startup) sets :resource/managed? true on resources that predate the attribute, and is a no-op on a second call"
+    (let [conn (fresh-conn)]
+      ;; Simulate a pre-existing (pre-issue-#26) database: transact a
+      ;; resource entity directly, bypassing resource->tx, so it has no
+      ;; :resource/managed? value at all.
+      (d/transact conn {:tx-data [{:resource/id   "aws_s3_bucket.legacy"
+                                    :resource/type "aws_s3_bucket"}]})
+      (db/backfill-managed-flag! conn)
+      (is (= true (:resource/managed? (d/pull (d/db conn) [:resource/managed?] [:resource/id "aws_s3_bucket.legacy"]))))
+      ;; Calling the backfill again (as a subsequent process start would)
+      ;; must not error and must leave the now-tagged entity's value
+      ;; unchanged (a no-op).
+      (db/backfill-managed-flag! conn)
+      (is (= true (:resource/managed? (d/pull (d/db conn) [:resource/managed?] [:resource/id "aws_s3_bucket.legacy"])))))))

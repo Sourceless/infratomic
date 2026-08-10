@@ -4,6 +4,7 @@
   (:require [infratomic.state-backend.db :as db]
             [infratomic.state-backend.handler :as handler]
             [infratomic.state-backend.policy :as policy]
+            [infratomic.state-backend.sync :as sync]
             [ring.adapter.jetty :as jetty])
   (:gen-class))
 
@@ -11,13 +12,16 @@
 
 (defn app-handler
   "The full Ring handler: `handler.clj`'s own `/state` dispatch (untouched),
-  plus the new `POST /policy-check` route (`policy.clj`) layered in front of
-  it, both closing over the one dev-local `conn` this process holds. Any
-  other method on `/policy-check` gets an explicit `405` rather than
-  falling through to `state-handler` (which knows nothing about this route
-  and would 404 it). Public (rather than `defn-`) so it's directly
-  testable, mirroring `handler/handler`."
-  [conn]
+  plus the `POST /policy-check` (`policy.clj`) and `POST /sync` (`sync.clj`)
+  routes layered in front of it, all closing over the one dev-local `conn`
+  this process holds (`/sync` also closes over `ec2-client`, an EC2 client
+  built once at process start and reused across every Sync invocation - an
+  implementation choice, not a correctness one, see design.md). Any other
+  method on `/policy-check`/`/sync` gets an explicit `405` rather than
+  falling through to `state-handler` (which knows nothing about these
+  routes and would 404 them). Public (rather than `defn-`) so it's
+  directly testable, mirroring `handler/handler`."
+  [conn ec2-client]
   (let [state-handler (handler/handler conn)]
     (fn [{:keys [request-method uri body] :as request}]
       (cond
@@ -27,11 +31,18 @@
         (= uri "/policy-check")
         {:status 405 :headers {"Allow" "POST"} :body ""}
 
+        (and (= uri "/sync") (= request-method :post))
+        (sync/sync-endpoint conn ec2-client)
+
+        (= uri "/sync")
+        {:status 405 :headers {"Allow" "POST"} :body ""}
+
         :else
         (state-handler request)))))
 
 (defn -main
   [& _args]
-  (let [conn (db/ensure-db! (db/client))]
+  (let [conn (db/ensure-db! (db/client))
+        ec2-client (sync/ec2-client)]
     (println (str "State Backend listening on port " port))
-    (jetty/run-jetty (app-handler conn) {:port port :join? true})))
+    (jetty/run-jetty (app-handler conn ec2-client) {:port port :join? true})))
