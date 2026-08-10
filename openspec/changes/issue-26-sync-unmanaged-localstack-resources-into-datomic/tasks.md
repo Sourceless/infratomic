@@ -39,10 +39,10 @@
 
 ## 6. End-to-end verification against the sample app
 
-- [ ] 6.1 Bring up LocalStack and the State Backend; apply the sample app via Terraform as usual.
-- [ ] 6.2 Directly create a security group with an ingress rule opening port 22 to `0.0.0.0/0` via `aws`/`awslocal` against LocalStack, bypassing Terraform entirely.
-- [ ] 6.3 Confirm `query/security-groups-with-port-22-open` (invoked directly, per `query_integration_test.clj`'s pattern) does not yet include that security group.
-- [ ] 6.4 Run the CLI's `sync` subcommand; confirm it reports the new security group (and its rule) as discovered.
-- [ ] 6.5 Re-run the same query; confirm the directly-created security group now appears in the results.
-- [ ] 6.6 Confirm `terraform plan`/`apply` in the sample app afterward shows no attempt to adopt/destroy the discovered security group, and `GET /state` (`terraform state list`) does not list it.
-- [ ] 6.7 Run `sync` a second time with no LocalStack changes; confirm no duplicate entities are created (e.g. via a direct Datomic query counting entities matching that AWS id).
+- [x] 6.1 Bring up LocalStack and the State Backend; apply the sample app via Terraform as usual.
+- [x] 6.2 Directly create a security group with an ingress rule opening port 22 to `0.0.0.0/0` via `aws`/`awslocal` against LocalStack, bypassing Terraform entirely.
+- [x] 6.3 Confirm `query/security-groups-with-port-22-open` (invoked directly, per `query_integration_test.clj`'s pattern) does not yet include that security group.
+- [x] 6.4 Run the CLI's `sync` subcommand; confirm it reports the new security group (and its rule) as discovered.
+- [x] 6.5 Re-run the same query; confirm the directly-created security group now appears in the results.
+- [x] 6.6 Confirm `terraform plan`/`apply` in the sample app afterward shows no attempt to adopt/destroy the discovered security group, and `GET /state` (`terraform state list`) does not list it.
+- [x] 6.7 Run `sync` a second time with no LocalStack changes; confirm no duplicate entities are created (e.g. via a direct Datomic query counting entities matching that AWS id).
