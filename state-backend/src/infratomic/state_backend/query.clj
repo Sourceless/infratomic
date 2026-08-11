@@ -90,6 +90,92 @@
                           (generic-matches db key candidates))]
     (map #(d/pull db resource-summary-pattern %) eids)))
 
+;; ---------------------------------------------------------------------------
+;; Drift detection (issue #27)
+;; ---------------------------------------------------------------------------
+
+(defn- sync-sourced-managed-resources
+  "`[eid type]` pairs for every managed (`:resource/managed? true`)
+  resource whose current `:resource/last-write-source` is `:sync` - the
+  only resources that can possibly be drifted, since a resource whose
+  most recent write came from Terraform is by definition not drifted from
+  Terraform's own last-asserted value."
+  [db]
+  (d/q '[:find ?e ?type
+         :where
+         [?e :resource/managed? true]
+         [?e :resource/last-write-source :sync]
+         [?e :resource/type ?type]]
+       db))
+
+(defn- last-terraform-write-tx
+  "The most recent transaction id in which `eid`'s
+  `:resource/last-write-source` was *asserted* `:terraform`, or `nil` if
+  it never was (a resource Sync discovered directly has no such
+  transaction, and is never a candidate here anyway - see
+  `sync-sourced-managed-resources`, which only considers already-managed
+  resources). The 5-tuple pattern's trailing `true` is required - without
+  it, a history-db query matches both the assertion *and* the later
+  retraction of the same `[e a v]` (a cardinality-one attribute's history
+  retains both when a new value supersedes it), so an unfiltered `(max
+  ?tx)` would pick up the retraction's (later) transaction instead of the
+  assertion's."
+  [db eid]
+  (ffirst (d/q '[:find (max ?tx)
+                 :in $ ?e
+                 :where
+                 [?e :resource/last-write-source :terraform ?tx true]]
+               (d/history db) eid)))
+
+(defn drifted-resources
+  "The drift Rule (design.md's \"Drift Rule: d/history-based comparison\"):
+  every managed resource whose most recent write source is `:sync` and
+  whose current live attribute values differ from the values Terraform
+  last asserted for it - i.e. its stored attributes as of the most recent
+  transaction where `:resource/last-write-source` held `:terraform`
+  (found via `d/history`/`d/as-of`, `db/stored-attributes` reconstructing
+  both sides so the diff compares like-for-like). Both sides are narrowed
+  to `type`'s modeled keys via `db/comparable-attributes` before
+  comparing - Sync never observes (and so never legitimately drifts) a
+  resource's other, unmodeled attributes, and a Terraform-managed
+  resource's own unrelated `:sync` update already retracts its stored
+  generic sub-entities (`resource-upsert-retractions`), which would
+  otherwise make an unscoped full-attribute-map comparison see permanent
+  phantom drift on those unrelated keys forever after. A resource whose
+  most recent write is `:terraform` (never drifted), or one with no prior
+  `:terraform`-sourced write at all (Sync-discovered, never
+  Terraform-managed), is never included - matching the resource-sync/
+  drift-detection specs' scenarios.
+
+  This function is query-time-only: it is deliberately **not** registered
+  in `policy.clj`'s `rules` vector, so it never runs as part of the
+  pre-apply Policy Check (see that namespace and the drift-detection
+  spec's \"excluded from the pre-apply Policy Check\" requirement)."
+  [db]
+  (into []
+        (keep (fn [[eid type]]
+                (when-let [tx (last-terraform-write-tx db eid)]
+                  (let [terraform-attrs (db/comparable-attributes type (db/stored-attributes (d/as-of db tx) eid type))
+                        live-attrs      (db/comparable-attributes type (db/stored-attributes db eid type))]
+                    (when (not= terraform-attrs live-attrs)
+                      (d/pull db resource-summary-pattern eid))))))
+        (sync-sourced-managed-resources db)))
+
+(defn- resource->json
+  [{:resource/keys [id type]}]
+  {"type" type "id" id})
+
+(defn drift-endpoint
+  "Handle a `GET /drift` request: evaluate the drift Rule
+  (`drifted-resources`) against `(d/db conn)` and respond `200` with
+  `{\"drifted\": [{\"type\" ... \"id\" ...} ...]}` (`[]` when no drift is
+  present). Read-only - never creates, modifies, or retracts any resource
+  entity or state version. Takes no request body and no query params."
+  [conn]
+  {:status  200
+   :headers {"Content-Type" "application/json"}
+   :body    (json/generate-string {"drifted" (mapv resource->json (drifted-resources (d/db conn)))})})
+
 (defn security-groups-with-port-22-open
   "Every `aws_security_group` resource with at least one associated
   `aws_security_group_rule` permitting ingress on port 22 from

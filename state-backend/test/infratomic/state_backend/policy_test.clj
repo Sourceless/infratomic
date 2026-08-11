@@ -8,7 +8,8 @@
             [datomic.client.api :as d]
             [infratomic.state-backend.db :as db]
             [infratomic.state-backend.handler :as handler]
-            [infratomic.state-backend.policy :as policy]))
+            [infratomic.state-backend.policy :as policy]
+            [infratomic.state-backend.sync :as sync]))
 
 (defn- fresh-conn
   "A connection to a freshly-created, schema-loaded, in-memory dev-local
@@ -196,3 +197,16 @@
                                        (security-group-id-ref "aws_security_group.ssh_open"))])]
         (policy/policy-check conn (json/generate-string plan))
         (is (= before (handler/get-state conn)))))))
+
+(deftest policy-check-response-is-unaffected-by-existing-drift
+  (testing "an existing drifted Terraform-managed resource never appears as a Policy Check Violation (issue #27 - the drift Rule is deliberately not registered in policy.clj's rules)"
+    (let [conn (fresh-conn)]
+      (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1" "vpc_id" "vpc-a"})]))
+      (let [db (d/db conn)
+            {:keys [tx-data outcome]} (sync/resource-tx db "aws_security_group" "sg-1" {"id" "sg-1" "vpc_id" "vpc-changed"})]
+        (is (= :drifted outcome))
+        (d/transact conn {:tx-data tx-data}))
+      (let [plan (plan-doc
+                  [(planned-resource "aws_security_group" "https_only" {"id" nil})]
+                  [(config-resource "aws_security_group" "https_only")])]
+        (is (empty? (policy/evaluate conn plan)))))))

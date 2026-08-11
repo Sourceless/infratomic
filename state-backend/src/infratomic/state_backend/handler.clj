@@ -55,21 +55,23 @@
   "Build the upsert tx-data for one *managed* entry in the posted state's
   `resources[]`, referencing the new state-version via its tempid: the
   resource's own upsert tx-map (attributes decomposed into typed/generic
-  datoms via `db/resource-attr-tx`), plus any retractions needed so a
-  changed attribute set doesn't just accumulate stale datoms alongside the
-  new ones (see `db/resource-upsert-retractions`)."
+  datoms via `db/resource-attr-tx`, `:resource/last-write-source` always
+  `:terraform`), plus any retractions needed so a changed attribute set
+  doesn't just accumulate stale datoms alongside the new ones (see
+  `db/resource-upsert-retractions`)."
   [db state-version-tempid resource]
   (let [instance   (-> resource (get "instances") first)
         attributes (get instance "attributes" {})
         type       (get resource "type")
         id         (resource-id resource)
         tx-map     (merge
-                    {:resource/id             id
-                     :resource/type           type
-                     :resource/name           (get resource "name")
-                     :resource/managed?       true
-                     :resource/instance-meta  (instance-meta resource instance)
-                     :resource/state-version  state-version-tempid}
+                    {:resource/id                 id
+                     :resource/type               type
+                     :resource/name               (get resource "name")
+                     :resource/managed?           true
+                     :resource/last-write-source  :terraform
+                     :resource/instance-meta      (instance-meta resource instance)
+                     :resource/state-version      state-version-tempid}
                     (db/resource-attr-tx type attributes))]
     (into [tx-map] (db/resource-upsert-retractions db id type attributes))))
 

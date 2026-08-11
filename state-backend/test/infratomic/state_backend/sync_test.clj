@@ -166,8 +166,32 @@
                              {:GroupName "infratomic-test-app-ssh-open" :GroupId "sg-b450dcc8007bd5693"}]}))))
 
 ;; ---------------------------------------------------------------------------
+;; db/comparable-attributes - the diff-gate/drift-Rule comparison primitive
+;; (issue #29 review findings: cardinality-many order-sensitivity and
+;; empty-collection asymmetry, both false-drift sources)
+;; ---------------------------------------------------------------------------
+
+(deftest comparable-attributes-normalizes-cardinality-many-order
+  (testing "same set of values in a different order compares equal"
+    (is (= (db/comparable-attributes "aws_instance"
+                                      {"id" "i-1" "vpc_security_group_ids" ["sg-aaa" "sg-bbb"]})
+           (db/comparable-attributes "aws_instance"
+                                      {"id" "i-1" "vpc_security_group_ids" ["sg-bbb" "sg-aaa"]}))))
+  (testing "a genuinely different set does not compare equal"
+    (is (not= (db/comparable-attributes "aws_instance"
+                                         {"id" "i-1" "vpc_security_group_ids" ["sg-aaa" "sg-bbb"]})
+              (db/comparable-attributes "aws_instance"
+                                         {"id" "i-1" "vpc_security_group_ids" ["sg-aaa" "sg-ccc"]})))))
+
+(deftest comparable-attributes-drops-empty-collection-same-as-absent-key
+  (is (= (db/comparable-attributes "aws_instance" {"id" "i-1" "subnet_id" "subnet-1"})
+         (db/comparable-attributes "aws_instance"
+                                    {"id" "i-1" "subnet_id" "subnet-1" "vpc_security_group_ids" []}))))
+
+;; ---------------------------------------------------------------------------
 ;; Matching/ingestion decision (resource-tx) - issue #26's core "no
-;; duplicates, Terraform-managed left untouched" behavior
+;; duplicates" behavior, plus issue #27's diff-gated update-on-drift for a
+;; Terraform-managed match (superseding #26's "left untouched" behavior)
 ;; ---------------------------------------------------------------------------
 
 (defn- eid-by-aws-id
@@ -185,20 +209,102 @@
     (d/transact conn {:tx-data tx-data})
     (let [db'    (d/db conn)
           eid    (eid-by-aws-id db' :aws-security-group/id "sg-999")
-          pulled (d/pull db' [:resource/id :resource/managed?] eid)]
+          pulled (d/pull db' [:resource/id :resource/managed? :resource/last-write-source] eid)]
       (is (= "aws_security_group.discovered-sg-999" (:resource/id pulled)))
-      (is (= false (:resource/managed? pulled))))))
+      (is (= false (:resource/managed? pulled)))
+      (is (= :sync (:resource/last-write-source pulled))))))
 
-(deftest resource-tx-matching-a-terraform-managed-resource-is-skipped
+;; ---------------------------------------------------------------------------
+;; resource-tx matching a Terraform-managed resource - diff-gated
+;; update-on-drift (issue #27, superseding issue #26's "left untouched"
+;; behavior)
+;; ---------------------------------------------------------------------------
+
+(defn- managed-conn-with
+  "A fresh conn with one Terraform-managed `aws_security_group` entity
+  already transacted, `:aws-security-group/id \"sg-managed\"`, tagged
+  `:resource/last-write-source :terraform` as `resource->tx`/`POST /state`
+  would."
+  []
   (let [conn (fresh-conn)]
-    (d/transact conn {:tx-data [{:resource/id             "aws_security_group.ssh_open"
-                                  :resource/type           "aws_security_group"
-                                  :resource/managed?       true
-                                  :aws-security-group/id   "sg-managed"}]})
-    (let [db (d/db conn)
+    (d/transact conn {:tx-data [{:resource/id                 "aws_security_group.ssh_open"
+                                  :resource/type               "aws_security_group"
+                                  :resource/managed?           true
+                                  :resource/last-write-source  :terraform
+                                  :aws-security-group/id       "sg-managed"}]})
+    conn))
+
+(deftest resource-tx-matching-a-terraform-managed-resource-with-no-drift-makes-no-write
+  (testing "observed live value identical to what's stored: no tx-data, outcome :skipped-already-managed"
+    (let [conn (managed-conn-with)
+          db   (d/db conn)
           {:keys [tx-data outcome]} (sync/resource-tx db "aws_security_group" "sg-managed" {"id" "sg-managed"})]
       (is (= :skipped-already-managed outcome))
       (is (empty? tx-data)))))
+
+(deftest resource-tx-matching-a-terraform-managed-resource-with-drift-updates-and-retags
+  (testing "observed live value differs from what's stored: updates the resource, tags :sync, outcome :drifted"
+    (let [conn (managed-conn-with)
+          db   (d/db conn)
+          {:keys [tx-data outcome]} (sync/resource-tx db "aws_security_group" "sg-managed" {"id" "sg-managed" "vpc_id" "vpc-changed"})]
+      (is (= :drifted outcome))
+      (is (seq tx-data))
+      (d/transact conn {:tx-data tx-data})
+      (let [db'    (d/db conn)
+            eid    (eid-by-aws-id db' :aws-security-group/id "sg-managed")
+            pulled (d/pull db' [:resource/id :resource/managed? :resource/last-write-source
+                                 :aws-security-group/vpc-id] eid)]
+        (is (= "aws_security_group.ssh_open" (:resource/id pulled)))
+        (is (= true (:resource/managed? pulled)))
+        (is (= :sync (:resource/last-write-source pulled)))
+        (is (= "vpc-changed" (:aws-security-group/vpc-id pulled)))))))
+
+;; ---------------------------------------------------------------------------
+;; resource-tx matching a Terraform-managed resource with a cardinality-many
+;; modeled attribute (`vpc_security_group_ids`) - issue #29 review finding:
+;; Datomic's pull order for such an attribute is independent of the order
+;; the freshly-observed value is built in, so the diff-gate must not treat a
+;; same-set-different-order value as drift.
+;; ---------------------------------------------------------------------------
+
+(defn- managed-conn-with-instance
+  "A fresh conn with one Terraform-managed `aws_instance` entity already
+  transacted (as `resource->tx`/`POST /state` would), with two
+  `vpc_security_group_ids` values."
+  []
+  (let [conn (fresh-conn)
+        tx   (merge {:resource/id                 "aws_instance.web"
+                      :resource/type               "aws_instance"
+                      :resource/managed?           true
+                      :resource/last-write-source  :terraform}
+                     (db/resource-attr-tx "aws_instance"
+                                          {"id"                     "i-managed"
+                                           "subnet_id"              "subnet-1"
+                                           "vpc_security_group_ids" ["sg-aaa" "sg-bbb"]}))]
+    (d/transact conn {:tx-data [tx]})
+    conn))
+
+(deftest resource-tx-cardinality-many-attribute-same-set-different-order-is-not-drift
+  (testing "observed value is the same set of security group ids, just pulled/observed in a different order: no drift"
+    (let [conn (managed-conn-with-instance)
+          db   (d/db conn)
+          {:keys [tx-data outcome]}
+          (sync/resource-tx db "aws_instance" "i-managed"
+                             {"id" "i-managed" "subnet_id" "subnet-1"
+                              "vpc_security_group_ids" ["sg-bbb" "sg-aaa"]})]
+      (is (= :skipped-already-managed outcome))
+      (is (empty? tx-data)))))
+
+(deftest resource-tx-cardinality-many-attribute-actual-change-is-drift
+  (testing "observed value is a genuinely different set of security group ids: real drift"
+    (let [conn (managed-conn-with-instance)
+          db   (d/db conn)
+          {:keys [tx-data outcome]}
+          (sync/resource-tx db "aws_instance" "i-managed"
+                             {"id" "i-managed" "subnet_id" "subnet-1"
+                              "vpc_security_group_ids" ["sg-aaa" "sg-ccc"]})]
+      (is (= :drifted outcome))
+      (is (seq tx-data)))))
 
 (deftest resource-tx-matching-a-previously-discovered-resource-updates-in-place
   (let [conn (fresh-conn)
@@ -209,6 +315,9 @@
           {:keys [tx-data outcome]} (sync/resource-tx db1 "aws_security_group" "sg-999" {"id" "sg-999" "vpc_id" "vpc-2"})]
       (is (= :updated outcome))
       (d/transact conn {:tx-data tx-data})
-      (let [eids (map first (d/q '[:find ?e :where [?e :aws-security-group/id "sg-999"]] (d/db conn)))]
+      (let [db'  (d/db conn)
+            eids (map first (d/q '[:find ?e :where [?e :aws-security-group/id "sg-999"]] db'))]
         (is (= 1 (count eids)))
-        (is (= "vpc-2" (:aws-security-group/vpc-id (d/pull (d/db conn) [:aws-security-group/vpc-id] (first eids)))))))))
+        (let [pulled (d/pull db' [:aws-security-group/vpc-id :resource/last-write-source] (first eids))]
+          (is (= "vpc-2" (:aws-security-group/vpc-id pulled)))
+          (is (= :sync (:resource/last-write-source pulled))))))))

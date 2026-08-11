@@ -24,6 +24,14 @@ _Avoid_: unmanaged resource, out-of-band resource, drifted resource
 The State Backend operation, triggered by the CLI's `sync` subcommand over HTTP (mirroring how `apply` triggers Policy Check), that queries LocalStack's EC2 API directly and ingests any resources not already known as Discovered Resources — runs inside the State Backend process itself so it shares the one dev-local connection the process already holds, rather than opening a second one.
 _Avoid_: discovery, ingestion, drift sync
 
+**Write Source**:
+`:resource/last-write-source` (`:terraform` or `:sync`) — which write path most recently wrote a Resource entity's attributes: `:terraform` for a `POST /state` write (`resource->tx`); `:sync` for any Sync write (`resource-tx`) — a newly Discovered Resource, an update to a previously-discovered one, or a diff-gated update to a previously Terraform-managed resource whose observed live value had Drifted. Set on every write, by both write paths, mirroring `:resource/managed?`'s "set on every write" discipline (see ADR-0009). The drift Rule reads it, plus Datomic history, to find Terraform's last-asserted values to compare a managed resource's current values against.
+_Avoid_: source tag, write tag, origin
+
+**Drift**:
+An out-of-band change to a Terraform-managed resource: a live value in LocalStack diverging from what Terraform itself last asserted for it. Detected by the drift Rule (`query.clj`), a query-time-only function — deliberately never registered in `policy.clj`'s Rule registry — that finds every managed resource whose most recent Write Source is `:sync` and compares its current attributes against its stored values as of the most recent `:terraform`-sourced write (found via Datomic history, `d/history`/`d/as-of` — see ADR-0009). Surfaced via `GET /drift` and the CLI's `drift-check` subcommand. Distinct from a Discovered Resource: a Discovered Resource was never Terraform-managed in the first place, whereas Drift is a Terraform-managed resource whose live value has since diverged. Detection only — nothing auto-remediates Drift (reverting the live value or re-applying Terraform to overwrite it), and it is never evaluated as part of the pre-apply Policy Check.
+_Avoid_: unmanaged resource, out-of-band resource (see Discovered Resource), skew
+
 **Reconstructed State**:
 The Terraform-state-JSON document the State Backend builds on `GET`, on the fly, from the latest State Version entity plus the current set of Resource entities. Not byte-identical to what Terraform last `POST`ed — Terraform parses it structurally rather than diffing it, so this is semantically equivalent, not a stored artifact. No raw state JSON is ever stored anywhere.
 _Avoid_: raw state, state blob, state file

@@ -228,6 +228,14 @@
     (let [db (d/db conn)]
       (is (= true (:resource/managed? (d/pull db [:resource/managed?] [:resource/id "aws_s3_bucket.uploads"])))))))
 
+(deftest posted-resource-is-tagged-terraform-sourced
+  (testing "a POST /state write records :resource/last-write-source :terraform (issue #27)"
+    (let [conn (fresh-conn)]
+      (handler/post-state conn (state-body [(resource "aws_s3_bucket" "uploads")]))
+      (let [db (d/db conn)]
+        (is (= :terraform (:resource/last-write-source
+                            (d/pull db [:resource/last-write-source] [:resource/id "aws_s3_bucket.uploads"]))))))))
+
 (deftest discovered-resource-is-excluded-from-get
   (testing "a :resource/managed? false entity never appears in GET /state, even alongside managed resources"
     (let [conn (fresh-conn)]
@@ -260,3 +268,20 @@
       ;; unchanged (a no-op).
       (db/backfill-managed-flag! conn)
       (is (= true (:resource/managed? (d/pull (d/db conn) [:resource/managed?] [:resource/id "aws_s3_bucket.legacy"])))))))
+
+(deftest backfill-tags-pre-existing-untagged-entities-with-terraform-write-source-and-is-idempotent
+  (testing "db/backfill-last-write-source! (the step ensure-db! runs on every startup) sets :resource/last-write-source :terraform on resources that predate the attribute, and is a no-op on a second call (issue #27)"
+    (let [conn (fresh-conn)]
+      ;; Simulate a pre-existing (pre-issue-#27) database: transact a
+      ;; resource entity directly, bypassing resource->tx, so it has no
+      ;; :resource/last-write-source value at all.
+      (d/transact conn {:tx-data [{:resource/id       "aws_s3_bucket.legacy"
+                                    :resource/type     "aws_s3_bucket"
+                                    :resource/managed? true}]})
+      (db/backfill-last-write-source! conn)
+      (is (= :terraform (:resource/last-write-source (d/pull (d/db conn) [:resource/last-write-source] [:resource/id "aws_s3_bucket.legacy"]))))
+      ;; Calling the backfill again (as a subsequent process start would)
+      ;; must not error and must leave the now-tagged entity's value
+      ;; unchanged (a no-op).
+      (db/backfill-last-write-source! conn)
+      (is (= :terraform (:resource/last-write-source (d/pull (d/db conn) [:resource/last-write-source] [:resource/id "aws_s3_bucket.legacy"])))))))
