@@ -5,7 +5,12 @@
   same way a real out-of-band/drifted resource would exist - then runs the
   real `sync!` pass (real `cognitect.aws/api` calls against LocalStack, real
   Datomic dev-local transactions) and asserts on its result and on the
-  resulting db.
+  resulting db. Also covers issue #27's out-of-band drift on an *already*
+  Terraform-managed resource: directly changing one of the sample app's
+  instances' security groups (`ModifyInstanceAttribute`, same
+  `InstanceId`) and asserting Sync updates it (tagging
+  `:resource/last-write-source :sync`, reporting it in the `:drifted`
+  summary bucket) and that `GET /drift` reflects it.
 
   NOT part of the hermetic `clojure -X:test` suite (see `test_runner.clj`)
   - it shells out to real `terraform`/`docker` and makes real LocalStack API
@@ -137,6 +142,98 @@
                 ;; repeatedly" property).
                 (aws/invoke client {:op :DeleteSecurityGroup :request {:GroupId sg-id}})
                 (aws/stop client)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Drift: a Terraform-managed resource changed out-of-band (issue #27)
+;; ---------------------------------------------------------------------------
+
+(defn- instance-id-by-name
+  "The `InstanceId` of the *running* instance tagged `Name` `name`. Filters
+  on `instance-state-name=running` (not just `tag:Name`) because
+  LocalStack, like real AWS, keeps terminated instances visible in
+  `DescribeInstances` indefinitely (see `sync.clj`'s `live-instance?`) - a
+  prior test run's now-terminated instance can share the same `Name` tag
+  (the sample app's tags are fixed, not randomized), so an unfiltered
+  lookup can resolve to a stale, no-longer-live instance instead of the
+  one this test just applied."
+  [client name]
+  (-> (aws/invoke client {:op :DescribeInstances
+                           :request {:Filters [{:Name "tag:Name" :Values [name]}
+                                                {:Name "instance-state-name" :Values ["running"]}]}})
+      :Reservations first :Instances first :InstanceId))
+
+(defn- security-group-id-by-name
+  "The `GroupId` of the security group named (its AWS `GroupName`, i.e.
+  Terraform's `name` attribute - `aws_security_group.https_only` has no
+  `Name` *tag* in the sample app config, unlike the instances, so this
+  filters on `group-name` rather than `tag:Name`) `name`."
+  [client name]
+  (-> (aws/invoke client {:op :DescribeSecurityGroups :request {:Filters [{:Name "group-name" :Values [name]}]}})
+      :SecurityGroups first :GroupId))
+
+(defn- drift-sample-app-instance!
+  "Directly changes the sample app's `aws_instance.workload_1`'s security
+  groups (`ModifyInstanceAttribute`, same `InstanceId` - a genuine
+  AWS-assigned id, so the same `:resource/id` per `sync/instance->attrs`)
+  to just `aws_security_group.https_only` - standing in for a real
+  out-of-band/drifted instance. (Deliberately not `aws_route`: a route has
+  no AWS-assigned id of its own - `sync/route->attrs` synthesizes one from
+  its route table + destination CIDR, a scheme independent of, and never
+  matching, the Terraform AWS provider's own internal route id, so a
+  Terraform-managed route can never be matched by Sync's id-based lookup
+  in the first place, real drift-or-not - confirmed against a real
+  LocalStack instance while developing this test. `aws_instance`'s `id` is
+  a real AWS-assigned id on both sides, so it doesn't have this problem.)
+  Returns `{:instance-id ... :new-security-group-id ...}` for assertions."
+  [client]
+  (let [instance-id (instance-id-by-name client "infratomic-test-app-workload-1")
+        new-sg-id   (security-group-id-by-name client "infratomic-test-app-https-only")]
+    (aws/invoke client {:op :ModifyInstanceAttribute
+                         :request {:InstanceId instance-id :Groups [new-sg-id]}})
+    {:instance-id instance-id :new-security-group-id new-sg-id}))
+
+(deftest sync-updates-and-get-drift-flags-a-terraform-managed-resource-changed-out-of-band
+  (with-state-backend-server
+    (fn [conn]
+      (with-applied-sample-app
+        (fn []
+          (let [client      (sync/ec2-client)
+                app-handler (main/app-handler conn client)
+                get-drift   (fn [] (json/parse-string
+                                     (:body (app-handler {:request-method :get :uri "/drift"}))))]
+            (testing "no drift before Sync has run"
+              (is (= [] (get (get-drift) "drifted"))))
+
+            (let [{:keys [instance-id new-security-group-id]} (drift-sample-app-instance! client)
+                  summary1 (sync/sync! conn client)]
+
+              (testing "the drifted instance is reported in the sync summary's :drifted bucket"
+                (is (contains? (into #{} (map :id) (:drifted summary1)) instance-id)))
+
+              (testing "the drifted instance's stored attributes and write source reflect the observed live value"
+                (let [db     (d/db conn)
+                      eid    (ffirst (d/q '[:find ?e :in $ ?id :where [?e :aws-instance/id ?id]] db instance-id))
+                      pulled (d/pull db [:resource/last-write-source
+                                          :aws-instance/vpc-security-group-id] eid)]
+                  (is (= :sync (:resource/last-write-source pulled)))
+                  (is (= [new-security-group-id] (:aws-instance/vpc-security-group-id pulled)))))
+
+              (testing "GET /drift now includes the drifted instance"
+                ;; GET /drift identifies resources by :resource/id (the
+                ;; Terraform address, "aws_instance.workload_1"), matching
+                ;; query.clj's existing Rule convention (resource-summary-
+                ;; pattern) - unlike sync!'s summary, which uses the raw
+                ;; AWS-assigned id since Discovered Resources have no
+                ;; Terraform address at all.
+                (is (contains? (into #{} (map #(get % "id")) (get (get-drift) "drifted")) "aws_instance.workload_1")))
+
+              (let [summary2 (sync/sync! conn client)]
+                (testing "re-running sync with no further out-of-band changes makes no additional writes"
+                  (is (empty? (:drifted summary2)))
+                  (let [db (d/db conn)]
+                    (is (= 1 (count (d/q '[:find ?e :in $ ?id :where [?e :aws-instance/id ?id]] db instance-id))))))))
+
+            (aws/stop client)))))))
 
 (deftest post-sync-endpoint-returns-a-summary-reflecting-real-localstack-resources
   (with-state-backend-server
