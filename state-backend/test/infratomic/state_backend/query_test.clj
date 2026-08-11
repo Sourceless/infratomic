@@ -8,7 +8,8 @@
             [datomic.client.api :as d]
             [infratomic.state-backend.db :as db]
             [infratomic.state-backend.handler :as handler]
-            [infratomic.state-backend.query :as query]))
+            [infratomic.state-backend.query :as query]
+            [infratomic.state-backend.sync :as sync]))
 
 (defn- fresh-conn
   []
@@ -110,6 +111,42 @@
   (let [db (seeded-db)]
     (is (= #{"aws_security_group.ssh_open"}
            (ids (query/security-groups-with-port-22-open db))))))
+
+;; ---------------------------------------------------------------------------
+;; drifted-resources - the drift Rule (issue #27)
+;; ---------------------------------------------------------------------------
+
+(deftest drifted-resources-a-terraform-only-resource-is-never-flagged
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1" "vpc_id" "vpc-a"})]))
+    (is (empty? (query/drifted-resources (d/db conn))))))
+
+(deftest drifted-resources-a-discovered-only-resource-is-never-flagged
+  (let [conn (fresh-conn)
+        db0  (d/db conn)
+        {:keys [tx-data]} (sync/resource-tx db0 "aws_security_group" "sg-1" {"id" "sg-1" "vpc_id" "vpc-a"})]
+    (d/transact conn {:tx-data tx-data})
+    (is (empty? (query/drifted-resources (d/db conn))))))
+
+(deftest drifted-resources-a-sync-update-matching-terraforms-value-is-not-flagged
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1" "vpc_id" "vpc-a"})]))
+    ;; Sync observes the exact same value already stored - no drift, no
+    ;; write at all.
+    (let [db (d/db conn)
+          {:keys [tx-data outcome]} (sync/resource-tx db "aws_security_group" "sg-1" {"id" "sg-1" "vpc_id" "vpc-a"})]
+      (is (= :skipped-already-managed outcome))
+      (is (empty? tx-data)))
+    (is (empty? (query/drifted-resources (d/db conn))))))
+
+(deftest drifted-resources-a-sync-update-with-a-different-value-is-flagged
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1" "vpc_id" "vpc-a"})]))
+    (let [db (d/db conn)
+          {:keys [tx-data outcome]} (sync/resource-tx db "aws_security_group" "sg-1" {"id" "sg-1" "vpc_id" "vpc-changed"})]
+      (is (= :drifted outcome))
+      (d/transact conn {:tx-data tx-data}))
+    (is (= #{"aws_security_group.ssh_open"} (ids (query/drifted-resources (d/db conn)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; reachable? - network reachability via graph traversal

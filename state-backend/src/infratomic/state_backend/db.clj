@@ -151,6 +151,10 @@
      :db/valueType   :db.type/boolean
      :db/cardinality :db.cardinality/one
      :db/doc         "true for a Terraform-managed resource (set by resource->tx on the POST /state path); false for a Discovered Resource (set by Sync). Read by GET /state reconstruction and stale-resource-retractions to exclude Discovered Resources from what Terraform is told it owns and from the stale-sweep."}
+    {:db/ident       :resource/last-write-source
+     :db/valueType   :db.type/keyword
+     :db/cardinality :db.cardinality/one
+     :db/doc         ":terraform for a write made via POST /state (resource->tx); :sync for a write made by Sync (resource-tx), whether creating a newly Discovered Resource or updating a resource (discovered or Terraform-managed) whose observed live value changed. Set on every resource-entity write, by both write paths. Read by the drift Rule (query.clj) to find managed resources whose most recent write source is :sync, and via d/history/d/as-of to locate the most recent :terraform-sourced write to compare against."}
     {:db/ident       :resource/type
      :db/valueType   :db.type/string
      :db/cardinality :db.cardinality/one
@@ -271,16 +275,43 @@
     (when (seq eids)
       (d/transact conn {:tx-data (mapv (fn [eid] [:db/add eid :resource/managed? true]) eids)}))))
 
+(defn- untagged-write-source-eids
+  "Entity ids of every resource entity with no `:resource/last-write-source`
+  value yet - i.e. every resource that predates that attribute. Every one
+  of these predates `:resource/last-write-source` entirely, so by
+  definition it was written via `POST /state` (see issue #27's design.md
+  Migration Plan)."
+  [db]
+  (map first (d/q '[:find ?e
+                     :where
+                     [?e :resource/id]
+                     (not [?e :resource/last-write-source _])]
+                   db)))
+
+(defn backfill-last-write-source!
+  "One-time, idempotent migration step: tag every resource entity that
+  predates `:resource/last-write-source` as `:terraform`-sourced. Runs on
+  every `ensure-db!` call (i.e. every process start), but after the first
+  run post-deploy the query above finds nothing, making every subsequent
+  call a no-op - mirrors `backfill-managed-flag!` exactly. Public (rather
+  than `defn-`) so it's directly testable against an isolated test db."
+  [conn]
+  (let [eids (untagged-write-source-eids (d/db conn))]
+    (when (seq eids)
+      (d/transact conn {:tx-data (mapv (fn [eid] [:db/add eid :resource/last-write-source :terraform]) eids)}))))
+
 (defn ensure-db!
   "Create the database if it doesn't already exist, connect, ensure the
-  schema is transacted, and backfill `:resource/managed? true` onto any
-  resource entity written before that attribute existed. Idempotent - safe
-  to call on every startup."
+  schema is transacted, and backfill `:resource/managed? true` /
+  `:resource/last-write-source :terraform` onto any resource entity
+  written before those attributes existed. Idempotent - safe to call on
+  every startup."
   [client]
   (d/create-database client {:db-name db-name})
   (let [conn (d/connect client {:db-name db-name})]
     (d/transact conn {:tx-data schema})
     (backfill-managed-flag! conn)
+    (backfill-last-write-source! conn)
     conn))
 
 ;; ---------------------------------------------------------------------------
@@ -606,6 +637,49 @@
   Terraform is never told it owns a Discovered Resource."
   [db]
   (map #(d/pull db resource-pull-pattern %) (managed-resource-eids db)))
+
+(defn stored-attributes
+  "Reconstruct one resource's currently-stored attribute map (the same
+  Terraform-shaped map `GET /state` reconstructs), given its entity id
+  `eid` and Terraform `type` - pulls `resource-pull-pattern` against `db`
+  and hands it to `reconstruct-attributes`. `db` may be a live db value or
+  a historical one (e.g. from `d/as-of`), so this doubles as the
+  comparison primitive for both Sync's diff-gated update-on-drift
+  (`sync.clj`'s `resource-tx`) and the drift Rule's history-based
+  comparison (`query.clj`)."
+  [db eid type]
+  (reconstruct-attributes type (d/pull db resource-pull-pattern eid)))
+
+(defn comparable-attributes
+  "`attrs` (a reconstructed or freshly Sync-observed Terraform-shaped
+  attribute map for `type`) restricted to `type`'s modeled keys
+  (`resource-schema`'s keys), with any key mapped to `nil` dropped.
+
+  Used to scope both Sync's diff-gated update-on-drift and the drift
+  Rule's history-based comparison to attributes Sync can actually
+  observe: every `sync.clj` `*->attrs` translation function only ever
+  produces keys covered by `resource-schema` for its type, so a
+  Terraform-managed resource's *other* attributes - e.g. `tags`,
+  `description`, an ARN, anything only ever set via `POST /state` and
+  stored generically (see `decompose-attributes`) - are never attributes
+  Sync could observe drifting in the first place; comparing the full
+  reconstructed attribute set (typed *and* generic) would spuriously
+  flag every such resource as drifted (or, symmetrically, make the drift
+  Rule see permanent phantom drift once Sync's own upsert-in-place
+  retracts those generic sub-entities on a real drift update - see
+  `resource-upsert-retractions`).
+
+  Dropping a `nil`-valued key rather than comparing it against `nil`
+  matters too: a `*->attrs` function sometimes maps a modeled key to
+  `nil` when AWS didn't return it (e.g. `gateway_id` on a peering-only
+  `aws_route`), but `decompose-attributes` never writes a datom for a
+  nil value, so the *reconstructed* side of the comparison never has
+  that key at all - without dropping it here, a present-but-nil key
+  would never structurally equal an absent one, again a false drift
+  positive independent of any real observed change."
+  [type attrs]
+  (let [keys (set (keys (get resource-schema type)))]
+    (into {} (filter (fn [[k v]] (and (contains? keys k) (some? v)))) attrs)))
 
 (defn all-state-version-eids
   "All state-version entity ids currently in the database. `DELETE` needs to

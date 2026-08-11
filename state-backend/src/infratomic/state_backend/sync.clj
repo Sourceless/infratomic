@@ -25,8 +25,11 @@
      `:resource/id` directly, since a Terraform-managed match has a
      different id shape than a Discovered Resource's synthesized one),
      and transact accordingly - a fresh discovery, an update to a
-     previously-discovered entity, or a no-op skip when the match is
-     already Terraform-managed."
+     previously-discovered entity, or (issue #27) a diff-gated update to
+     a Terraform-managed entity whose observed live value has drifted
+     out-of-band, tagging the write `:resource/last-write-source :sync`.
+     A Terraform-managed match whose live value hasn't changed gets no
+     write at all."
   (:require [cheshire.core :as json]
             [clojure.core.async :as a]
             [clojure.string :as str]
@@ -323,15 +326,18 @@
   (get-in db/resource-schema [type "id" :ident]))
 
 (defn- existing-match
-  "The existing Resource entity (if any), `{:resource/id ... :resource/managed? ...}`,
-  whose modeled id attribute for `type` equals `aws-id` - a Datalog query
-  on the modeled id ident (e.g. `:aws-security-group/id ?aws-id`), not a
-  `:resource/id` guess, since a Terraform-managed match's `:resource/id`
-  is `\"<type>.<name>\"`, not the synthesized discovered-resource shape."
+  "The existing Resource entity (if any), `{:db/id ... :resource/id ...
+  :resource/managed? ...}`, whose modeled id attribute for `type` equals
+  `aws-id` - a Datalog query on the modeled id ident (e.g.
+  `:aws-security-group/id ?aws-id`), not a `:resource/id` guess, since a
+  Terraform-managed match's `:resource/id` is `\"<type>.<name>\"`, not the
+  synthesized discovered-resource shape. `:db/id` is included so the
+  Terraform-managed branch can reconstruct the match's currently stored
+  attributes for the drift diff without a second lookup query."
   [db type aws-id]
   (when-let [ident (id-ident type)]
     (when-let [eid (ffirst (d/q '[:find ?e :in $ ?ident ?v :where [?e ?ident ?v]] db ident aws-id))]
-      (d/pull db [:resource/id :resource/managed?] eid))))
+      (d/pull db [:db/id :resource/id :resource/managed?] eid))))
 
 (defn- discovered-resource-id
   [type aws-id]
@@ -345,30 +351,53 @@
   keyed by *that* entity's `:resource/id` (an in-place upsert, plus the
   same stale-attribute retractions `POST /state`'s `resource->tx` uses,
   so a shrunk cardinality-many attribute doesn't just accumulate stale
-  datoms); an existing match that's Terraform-managed -> no tx-data,
-  left untouched. Returns `{:tx-data [...] :outcome (:discovered
-  :updated :skipped-already-managed)}`."
+  datoms); an existing match that's Terraform-managed -> diff its
+  currently stored attributes (reconstructed via `db/stored-attributes`)
+  against the freshly observed live `attributes`, both narrowed to
+  `type`'s modeled keys via `db/comparable-attributes` (Sync only ever
+  observes modeled attributes - comparing the resource's *other*,
+  unmodeled attributes, e.g. `tags` set only via `POST /state`, would
+  falsely read as drift): identical -> no tx-data,
+  `:skipped-already-managed`; different -> the same upsert-in-place
+  tx-data an already-discovered match gets, tagging
+  `:resource/last-write-source :sync`, outcome `:drifted`. Every tx-map
+  this fn produces sets `:resource/last-write-source :sync` - the only
+  write path (besides `POST /state`) a Resource entity ever goes through.
+  Returns `{:tx-data [...] :outcome (:discovered :updated :drifted
+  :skipped-already-managed)}`."
   [db type aws-id attributes]
   (let [match (existing-match db type aws-id)]
     (cond
       (nil? match)
-      {:tx-data [(merge {:resource/id       (discovered-resource-id type aws-id)
-                          :resource/type     type
-                          :resource/managed? false}
+      {:tx-data [(merge {:resource/id                 (discovered-resource-id type aws-id)
+                          :resource/type               type
+                          :resource/managed?           false
+                          :resource/last-write-source  :sync}
                          (db/resource-attr-tx type attributes))]
        :outcome :discovered}
 
       (false? (:resource/managed? match))
       (let [id (:resource/id match)]
-        {:tx-data (into [(merge {:resource/id       id
-                                  :resource/type     type
-                                  :resource/managed? false}
+        {:tx-data (into [(merge {:resource/id                 id
+                                  :resource/type               type
+                                  :resource/managed?           false
+                                  :resource/last-write-source  :sync}
                                  (db/resource-attr-tx type attributes))]
                          (db/resource-upsert-retractions db id type attributes))
          :outcome :updated})
 
       :else
-      {:tx-data [] :outcome :skipped-already-managed})))
+      (let [id     (:resource/id match)
+            eid    (:db/id match)
+            stored (db/stored-attributes db eid type)]
+        (if (= (db/comparable-attributes type stored) (db/comparable-attributes type attributes))
+          {:tx-data [] :outcome :skipped-already-managed}
+          {:tx-data (into [(merge {:resource/id                 id
+                                    :resource/type               type
+                                    :resource/last-write-source  :sync}
+                                   (db/resource-attr-tx type attributes))]
+                           (db/resource-upsert-retractions db id type attributes))
+           :outcome :drifted})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Full Sync pass
@@ -384,7 +413,12 @@
   decides each one's ingestion outcome against a single db snapshot
   (`resource-tx`), and transacts every resulting tx-data in one
   transaction. Returns a summary map: `{:discovered [{:type :id} ...]
-  :updated [{:type :id} ...] :skipped-already-managed <count>}`."
+  :updated [{:type :id} ...] :drifted [{:type :id} ...]
+  :skipped-already-managed <count>}`. `:drifted` lists each Terraform-
+  managed resource whose observed live value differed from what was
+  stored (and so was just updated, tagged `:sync`) - distinct from
+  `:updated`, which is a previously-discovered, non-Terraform-managed
+  resource that received new values."
   [conn client]
   (let [db        (d/db conn)
         resources (describe-all client)
@@ -397,6 +431,7 @@
       (d/transact conn {:tx-data tx-data}))
     {:discovered              (mapv :entry (filter #(= :discovered (:outcome %)) decisions))
      :updated                 (mapv :entry (filter #(= :updated (:outcome %)) decisions))
+     :drifted                 (mapv :entry (filter #(= :drifted (:outcome %)) decisions))
      :skipped-already-managed (count (filter #(= :skipped-already-managed (:outcome %)) decisions))}))
 
 ;; ---------------------------------------------------------------------------
@@ -408,18 +443,20 @@
   {"type" type "id" id})
 
 (defn- summary->json
-  [{:keys [discovered updated skipped-already-managed]}]
+  [{:keys [discovered updated drifted skipped-already-managed]}]
   {"discovered"               (mapv entry->json discovered)
    "updated"                  (mapv entry->json updated)
+   "drifted"                  (mapv entry->json drifted)
    "skipped_already_managed"  skipped-already-managed})
 
 (defn sync-endpoint
   "Handle a `POST /sync` request: run the full Sync pass (`sync!`) against
   `conn`/`client`, and respond `200` with the JSON-encoded summary
   (design.md's \"POST /sync endpoint shape\") - `{\"discovered\": [{\"type\"
-  ... \"id\" ...} ...], \"updated\": [...], \"skipped_already_managed\": N}`.
-  Takes no request body - Sync's inputs are \"whatever LocalStack currently
-  has\", not a client-supplied document."
+  ... \"id\" ...} ...], \"updated\": [...], \"drifted\": [...],
+  \"skipped_already_managed\": N}`. Takes no request body - Sync's inputs
+  are \"whatever LocalStack currently has\", not a client-supplied
+  document."
   [conn client]
   {:status  200
    :headers {"Content-Type" "application/json"}

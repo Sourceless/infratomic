@@ -5,7 +5,8 @@
   and getting a misleading `404` (see the routing `cond` in `app-handler`).
   `handler_test.clj`/`policy_test.clj` already cover each handler's own
   behavior in depth; this file only covers the dispatch between them."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [cheshire.core :as json]
+            [clojure.test :refer [deftest is]]
             [datomic.client.api :as d]
             [infratomic.state-backend.db :as db]
             [infratomic.state-backend.main :as main]))
@@ -36,3 +37,15 @@
 (deftest unknown-uri-still-404s
   (let [handler (main/app-handler (fresh-conn) nil)]
     (is (= 404 (:status (handler {:request-method :get :uri "/nope"}))))))
+
+(deftest drift-with-a-non-get-method-is-405-not-404
+  ;; nil ec2-client is safe here - /drift never touches it.
+  (let [handler (main/app-handler (fresh-conn) nil)]
+    (is (= 405 (:status (handler {:request-method :post :uri "/drift"}))))
+    (is (= 405 (:status (handler {:request-method :delete :uri "/drift"}))))))
+
+(deftest drift-with-get-returns-200-with-an-empty-list-on-a-fresh-db
+  (let [handler (main/app-handler (fresh-conn) nil)
+        response (handler {:request-method :get :uri "/drift"})]
+    (is (= 200 (:status response)))
+    (is (= [] (get (json/parse-string (:body response)) "drifted")))))
