@@ -148,6 +148,40 @@
       (d/transact conn {:tx-data tx-data}))
     (is (= #{"aws_security_group.ssh_open"} (ids (query/drifted-resources (d/db conn)))))))
 
+;; A cardinality-many modeled attribute (`vpc_security_group_ids`) is stored
+;; as independent datoms with no preserved ordinal, so `d/pull`'s order is
+;; independent of the order a freshly Sync-observed value is built in (issue
+;; #29 review finding). The Rule must not flag a same-set-different-order
+;; value as drift, but must still flag a genuinely different set.
+
+(deftest drifted-resources-cardinality-many-attribute-same-set-different-order-is-not-flagged
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_instance" "web"
+                                                      {"id" "i-1" "subnet_id" "subnet-1"
+                                                       "vpc_security_group_ids" ["sg-aaa" "sg-bbb"]})]))
+    (let [db (d/db conn)
+          {:keys [tx-data outcome]}
+          (sync/resource-tx db "aws_instance" "i-1"
+                             {"id" "i-1" "subnet_id" "subnet-1"
+                              "vpc_security_group_ids" ["sg-bbb" "sg-aaa"]})]
+      (is (= :skipped-already-managed outcome))
+      (is (empty? tx-data)))
+    (is (empty? (query/drifted-resources (d/db conn))))))
+
+(deftest drifted-resources-cardinality-many-attribute-actual-change-is-flagged
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_instance" "web"
+                                                      {"id" "i-1" "subnet_id" "subnet-1"
+                                                       "vpc_security_group_ids" ["sg-aaa" "sg-bbb"]})]))
+    (let [db (d/db conn)
+          {:keys [tx-data outcome]}
+          (sync/resource-tx db "aws_instance" "i-1"
+                             {"id" "i-1" "subnet_id" "subnet-1"
+                              "vpc_security_group_ids" ["sg-aaa" "sg-ccc"]})]
+      (is (= :drifted outcome))
+      (d/transact conn {:tx-data tx-data}))
+    (is (= #{"aws_instance.web"} (ids (query/drifted-resources (d/db conn)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; reachable? - network reachability via graph traversal
 ;; ---------------------------------------------------------------------------

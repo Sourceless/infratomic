@@ -650,10 +650,21 @@
   [db eid type]
   (reconstruct-attributes type (d/pull db resource-pull-pattern eid)))
 
+(defn- many-keys
+  "Set of `type`'s Terraform attribute keys (`resource-schema` keys, not
+  idents) that are modeled cardinality-many - e.g. `vpc_security_group_ids`
+  for `aws_instance`. Used by `comparable-attributes` to know which values
+  need order-normalizing before comparison."
+  [type]
+  (into #{} (keep (fn [[k v]] (when (= :db.cardinality/many (:cardinality v)) k)))
+        (get resource-schema type)))
+
 (defn comparable-attributes
   "`attrs` (a reconstructed or freshly Sync-observed Terraform-shaped
   attribute map for `type`) restricted to `type`'s modeled keys
-  (`resource-schema`'s keys), with any key mapped to `nil` dropped.
+  (`resource-schema`'s keys), with any key mapped to `nil` or an empty
+  collection dropped, and every cardinality-many modeled attribute's value
+  normalized to a canonical (sorted) order.
 
   Used to scope both Sync's diff-gated update-on-drift and the drift
   Rule's history-based comparison to attributes Sync can actually
@@ -676,10 +687,36 @@
   nil value, so the *reconstructed* side of the comparison never has
   that key at all - without dropping it here, a present-but-nil key
   would never structurally equal an absent one, again a false drift
-  positive independent of any real observed change."
+  positive independent of any real observed change. An empty-collection
+  value is dropped for the same reason: `decompose-attributes` never
+  writes a datom for an empty cardinality-many value either, so the
+  reconstructed side never has that key, while a freshly Sync-observed
+  empty collection (e.g. an instance with no security groups) would
+  otherwise keep it.
+
+  Normalizing cardinality-many values matters because Datomic stores each
+  value of a cardinality-many modeled attribute as an independent datom
+  with no preserved ordinal: `d/pull`'s return order for the reconstructed
+  side (`stored-attributes`) is whatever the index scan yields, unrelated
+  to the order the freshly-observed side is built in (e.g.
+  `instance->attrs`'s `(mapv :GroupId (:SecurityGroups instance))`). Without
+  sorting both sides into the same order first, plain `=`/`not=` would
+  falsely report drift on every sync run for any resource with 2+ values in
+  such an attribute, purely because of pull-vs-observed ordering - not any
+  real change."
   [type attrs]
-  (let [keys (set (keys (get resource-schema type)))]
-    (into {} (filter (fn [[k v]] (and (contains? keys k) (some? v)))) attrs)))
+  (let [keys (set (keys (get resource-schema type)))
+        many (many-keys type)]
+    (into {}
+          (comp
+           (filter (fn [[k v]] (and (contains? keys k)
+                                     (some? v)
+                                     (not (and (coll? v) (empty? v))))))
+           (map (fn [[k v]]
+                  (if (and (contains? many k) (coll? v))
+                    [k (vec (sort-by str v))]
+                    [k v]))))
+          attrs)))
 
 (defn all-state-version-eids
   "All state-version entity ids currently in the database. `DELETE` needs to
