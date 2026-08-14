@@ -155,6 +155,10 @@
      :db/valueType   :db.type/keyword
      :db/cardinality :db.cardinality/one
      :db/doc         ":terraform for a write made via POST /state (resource->tx); :sync for a write made by Sync (resource-tx), whether creating a newly Discovered Resource or updating a resource (discovered or Terraform-managed) whose observed live value changed. Set on every resource-entity write, by both write paths. Read by the drift Rule (query.clj) to find managed resources whose most recent write source is :sync, and via d/history/d/as-of to locate the most recent :terraform-sourced write to compare against."}
+    {:db/ident       :resource/sync-present?
+     :db/valueType   :db.type/boolean
+     :db/cardinality :db.cardinality/one
+     :db/doc         "Whether Sync's most recent full pass, for a Terraform-managed resource of one of the four FK-bearing child types this drift mechanism covers (aws_security_group_rule, aws_route, aws_route_table_association, aws_iam_role_policy_attachment), found this resource still present in AWS. true when found; false when Sync ran and did not find it (removed-child drift); absent when no Sync run covering this type has happened since the resource was created/last matched. Never read by GET /state reconstruction (absent from resource-pull-pattern) - purely a query-time signal for the removed-child Rule (query.clj)."}
     {:db/ident       :resource/type
      :db/valueType   :db.type/string
      :db/cardinality :db.cardinality/one
@@ -612,6 +616,41 @@
   regardless of whether it's mentioned in the posted body."
   [db]
   (into {} (d/q '[:find ?id ?e :where [?e :resource/id ?id] [?e :resource/managed? true]] db)))
+
+(defn managed-resource-ids-by-type
+  "Map of AWS-identifying value -> entity id, for every Terraform-managed
+  (`:resource/managed? true`) resource of `type` currently in the
+  database - keyed by that type's modeled `\"id\"` attribute's value
+  (e.g. `:aws-security-group-rule/id`) for an id-based type, or by the
+  `[role policy-arn]` pair for `\"aws_iam_role_policy_attachment\"`, the
+  one FK-bearing child type with no modeled id of its own (mirroring
+  `sync.clj`'s `existing-match`/`discovered-resource-id` composite-key
+  handling for that type). `nil` for a type with no modeled `\"id\"`
+  attribute other than the composite-keyed one. Used by Sync's
+  removed-child presence-marker step (`sync.clj`'s `sync!`) to diff a full
+  pass's observed AWS ids against what's currently stored, for each of
+  the four FK-bearing child types the removed-child drift mechanism
+  covers."
+  [db type]
+  (if (= type "aws_iam_role_policy_attachment")
+    (into {}
+          (map (fn [[role arn e]] [[role arn] e]))
+          (d/q '[:find ?role ?arn ?e
+                 :where
+                 [?e :resource/type "aws_iam_role_policy_attachment"]
+                 [?e :resource/managed? true]
+                 [?e :aws-iam-role-policy-attachment/role ?role]
+                 [?e :aws-iam-role-policy-attachment/policy-arn ?arn]]
+               db))
+    (when-let [ident (get-in resource-schema [type "id" :ident])]
+      (into {}
+            (d/q '[:find ?v ?e
+                   :in $ ?type ?ident
+                   :where
+                   [?e :resource/type ?type]
+                   [?e :resource/managed? true]
+                   [?e ?ident ?v]]
+                 db type ident)))))
 
 (def ^:private modeled-idents
   (into [] (comp (mapcat vals) (map :ident)) (vals resource-schema)))

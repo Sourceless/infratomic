@@ -165,6 +165,32 @@
            :SecurityGroups [{:GroupName "infratomic-test-app-reachability-open" :GroupId "sg-6bd43627d40050a11"}
                              {:GroupName "infratomic-test-app-ssh-open" :GroupId "sg-b450dcc8007bd5693"}]}))))
 
+(deftest iam-role-policy-attachment-translation
+  (is (= {"role" "infratomic-test-app-lambda-exec"
+          "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"}
+         (sync/iam-role-policy-attachment->attrs
+          "infratomic-test-app-lambda-exec"
+          {:PolicyName "AmazonS3ReadOnlyAccess"
+           :PolicyArn "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"}))))
+
+;; ---------------------------------------------------------------------------
+;; explicit-route?/subnet-association? - confirms AWS-implicit entries stay
+;; filtered out of describe-all's output (issue #32 task 4.4: the
+;; removed-child presence-marker step's observed-id sets are built directly
+;; from describe-all's output, so this already-shipped filtering continuing
+;; to hold is what keeps an implicit local route/main-table association from
+;; ever being treated as a candidate resource, managed or otherwise, in the
+;; first place - a regression test, not new filtering code).
+;; ---------------------------------------------------------------------------
+
+(deftest explicit-route?-excludes-the-implicit-local-route
+  (is (not (#'sync/explicit-route? {:Origin "CreateRouteTable" :GatewayId "local"})))
+  (is (#'sync/explicit-route? {:Origin "CreateRoute" :GatewayId "igw-1"})))
+
+(deftest subnet-association?-excludes-the-implicit-main-table-association
+  (is (not (#'sync/subnet-association? {:Main true})))
+  (is (#'sync/subnet-association? {:Main false :SubnetId "subnet-1"})))
+
 ;; ---------------------------------------------------------------------------
 ;; db/comparable-attributes - the diff-gate/drift-Rule comparison primitive
 ;; (issue #29 review findings: cardinality-many order-sensitivity and
@@ -321,3 +347,128 @@
         (let [pulled (d/pull db' [:aws-security-group/vpc-id :resource/last-write-source] (first eids))]
           (is (= "vpc-2" (:aws-security-group/vpc-id pulled)))
           (is (= :sync (:resource/last-write-source pulled))))))))
+
+;; ---------------------------------------------------------------------------
+;; resource-tx composite-key matching for aws_iam_role_policy_attachment
+;; (issue #32) - this type has no modeled "id" of its own, so matching is by
+;; the (role, policy_arn) pair together, not a single AWS-assigned id.
+;; ---------------------------------------------------------------------------
+
+(def ^:private lambda-attachment-attrs
+  {"role" "lambda-exec" "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"})
+
+(defn- managed-conn-with-attachment
+  "A fresh conn with one Terraform-managed `aws_iam_role_policy_attachment`
+  entity already transacted, matching `lambda-attachment-attrs`, tagged
+  `:resource/last-write-source :terraform` as `resource->tx`/`POST /state`
+  would."
+  []
+  (let [conn (fresh-conn)]
+    (d/transact conn {:tx-data [(merge {:resource/id                 "aws_iam_role_policy_attachment.lambda_s3"
+                                          :resource/type               "aws_iam_role_policy_attachment"
+                                          :resource/managed?           true
+                                          :resource/last-write-source  :terraform}
+                                         (db/resource-attr-tx "aws_iam_role_policy_attachment" lambda-attachment-attrs))]})
+    conn))
+
+(deftest resource-tx-with-no-existing-match-discovers-an-iam-role-policy-attachment
+  (let [conn (fresh-conn)
+        db   (d/db conn)
+        {:keys [tx-data outcome]} (sync/resource-tx db "aws_iam_role_policy_attachment" nil lambda-attachment-attrs)]
+    (is (= :discovered outcome))
+    (d/transact conn {:tx-data tx-data})
+    (let [db'    (d/db conn)
+          eid    (ffirst (d/q '[:find ?e :where [?e :aws-iam-role-policy-attachment/role "lambda-exec"]] db'))
+          pulled (d/pull db' [:resource/id :resource/managed?] eid)]
+      (is (= (str "aws_iam_role_policy_attachment.discovered-lambda-exec-"
+                  "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")
+             (:resource/id pulled)))
+      (is (= false (:resource/managed? pulled))))))
+
+(deftest resource-tx-matches-a-managed-attachment-by-role-and-policy-arn-together
+  (let [conn (managed-conn-with-attachment)
+        db   (d/db conn)
+        {:keys [tx-data outcome]} (sync/resource-tx db "aws_iam_role_policy_attachment" nil lambda-attachment-attrs)]
+    (is (= :skipped-already-managed outcome))
+    (is (empty? tx-data))))
+
+(deftest resource-tx-a-different-policy-on-the-same-role-is-discovered-not-matched
+  (let [conn (managed-conn-with-attachment)
+        db   (d/db conn)
+        {:keys [outcome]}
+        (sync/resource-tx db "aws_iam_role_policy_attachment" nil
+                           {"role" "lambda-exec" "policy_arn" "arn:aws:iam::aws:policy/AWSLambdaBasicExecutionRole"})]
+    (is (= :discovered outcome))))
+
+;; ---------------------------------------------------------------------------
+;; resource-tx reappearance fix (issue #32): a managed match whose
+;; :resource/sync-present? is currently false must still write (at minimum
+;; reasserting :resource/sync-present? true) even when attributes are
+;; unchanged, or the marker would never clear.
+;; ---------------------------------------------------------------------------
+
+(deftest resource-tx-reappearance-fix-forces-a-write-to-clear-a-false-sync-present-marker
+  (let [conn (managed-conn-with-attachment)]
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_iam_role_policy_attachment.lambda_s3"]
+                                  :resource/sync-present? false]]})
+    (let [db (d/db conn)
+          {:keys [tx-data outcome]} (sync/resource-tx db "aws_iam_role_policy_attachment" nil lambda-attachment-attrs)]
+      (is (= :skipped-already-managed outcome))
+      (is (seq tx-data))
+      (d/transact conn {:tx-data tx-data})
+      (let [db'    (d/db conn)
+            eid    (ffirst (d/q '[:find ?e :where [?e :aws-iam-role-policy-attachment/role "lambda-exec"]] db'))
+            pulled (d/pull db' [:resource/sync-present?] eid)]
+        (is (= true (:resource/sync-present? pulled)))))))
+
+(deftest resource-tx-a-genuinely-unchanged-covered-resource-with-no-prior-false-marker-makes-no-write
+  (testing "no reappearance to fix: the ordinary no-write skip is unaffected"
+    (let [conn (managed-conn-with-attachment)
+          db   (d/db conn)
+          {:keys [tx-data outcome]} (sync/resource-tx db "aws_iam_role_policy_attachment" nil lambda-attachment-attrs)]
+      (is (= :skipped-already-managed outcome))
+      (is (empty? tx-data)))))
+
+(defn- managed-conn-with-sg-rule
+  "A fresh conn with one Terraform-managed `aws_security_group_rule`
+  entity already transacted (id-based, unlike the attachment fixtures
+  above), tagged `:resource/last-write-source :terraform`."
+  []
+  (let [conn (fresh-conn)]
+    (d/transact conn {:tx-data [{:resource/id                       "aws_security_group_rule.ssh_open_ingress"
+                                  :resource/type                     "aws_security_group_rule"
+                                  :resource/managed?                 true
+                                  :resource/last-write-source        :terraform
+                                  :aws-security-group-rule/id        "sgr-managed"
+                                  :aws-security-group-rule/from-port 22
+                                  :aws-security-group-rule/to-port   22}]})
+    conn))
+
+(deftest resource-tx-a-covered-resource-drift-also-reasserts-the-marker-true
+  (let [conn (managed-conn-with-sg-rule)]
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_security_group_rule.ssh_open_ingress"]
+                                  :resource/sync-present? false]]})
+    (let [db (d/db conn)
+          {:keys [tx-data outcome]}
+          (sync/resource-tx db "aws_security_group_rule" "sgr-managed"
+                             {"id" "sgr-managed" "from_port" 2222 "to_port" 2222})]
+      (is (= :drifted outcome))
+      (d/transact conn {:tx-data tx-data})
+      (let [db'    (d/db conn)
+            eid    (ffirst (d/q '[:find ?e :where [?e :aws-security-group-rule/id "sgr-managed"]] db'))
+            pulled (d/pull db' [:resource/sync-present? :aws-security-group-rule/from-port] eid)]
+        (is (= true (:resource/sync-present? pulled)))
+        (is (= 2222 (:aws-security-group-rule/from-port pulled)))))))
+
+;; ---------------------------------------------------------------------------
+;; The sync-present? marker is never touched for a type outside
+;; sync-present-types (e.g. aws_security_group is not one of the four
+;; FK-bearing child types this mechanism covers).
+;; ---------------------------------------------------------------------------
+
+(deftest resource-tx-does-not-touch-sync-present-for-an-uncovered-type
+  (let [conn (managed-conn-with)
+        db   (d/db conn)
+        {:keys [tx-data outcome]} (sync/resource-tx db "aws_security_group" "sg-managed" {"id" "sg-managed"})]
+    (is (= :skipped-already-managed outcome))
+    (is (empty? tx-data))))
