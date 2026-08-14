@@ -150,6 +150,14 @@
 ;; group-rule case is already covered above
 ;; (`sync-discovers-out-of-band-resources-without-duplicating-or-touching-
 ;; managed-ones`); this covers the remaining three FK-bearing child types.
+;;
+;; `aws_route` is still hand-added here (to exercise Sync's route
+;; translation end-to-end against a real managed route table), but is
+;; deliberately NOT asserted as new-child drift below - it's one of the
+;; two types `query.clj`'s `new-child-detection-gap-types` excludes
+;; entirely (see that var's docstring and
+;; `sync-does-not-flag-terraform-managed-sg-rules-or-routes-as-new-child-
+;; drift` further down for why).
 ;; ---------------------------------------------------------------------------
 
 (defn- route-table-id-by-name
@@ -200,8 +208,8 @@
                     rt-c-eid (eid-by-aws-id db :aws-route-table/id rt-c-id)
                     role-eid (ffirst (d/q '[:find ?e :in $ ?name :where [?e :aws-iam-role/name ?name]] db role-name))
                     new-children (query/new-children-by-parent db)]
-                (testing "the hand-added route is a new child of the managed route table"
-                  (is (some #(= "aws_route" (:resource/type %)) (get new-children rt-a-eid))))
+                (testing "the hand-added route is NOT flagged as new-child drift (known Sync id-matching gap for aws_route)"
+                  (is (not (some #(= "aws_route" (:resource/type %)) (get new-children rt-a-eid)))))
                 (testing "the hand-added association is a new child of the managed route table (unmanaged subnet side)"
                   (is (some #(= "aws_route_table_association" (:resource/type %)) (get new-children rt-c-eid))))
                 (testing "the hand-attached policy is a new child of the managed IAM role"
@@ -216,6 +224,52 @@
                 (aws/invoke ec2-client {:op :DeleteSubnet :request {:SubnetId subnet-id}})
                 (aws/stop ec2-client)
                 (aws/stop iam-client)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Code-review regression (issue #32 PR #36, Finding 1): a freshly-applied,
+;; never-touched sample app - real `aws_security_group_rule`/`aws_route`
+;; instances included - must report zero new-child drift after a single
+;; `sync!` pass. Before the fix, the `aws_security_group_rule`/`aws_route`
+;; id-matching gap (`sync.clj`'s `sync-present-types` docstring) made
+;; `resource-tx` treat every one of the sample app's own already-managed
+;; rules/routes as unmatched, producing a permanent Discovered-Resource
+;; duplicate of each that `new-children-by-parent` then misreported as
+;; new-child drift on its own real, unmodified managed parent - exactly
+;; what the drift-detection spec's "A Terraform-managed child is not
+;; flagged as new-child drift" scenario forbids.
+;; ---------------------------------------------------------------------------
+
+(deftest sync-does-not-flag-terraform-managed-sg-rules-or-routes-as-new-child-drift
+  (with-state-backend-server
+    (fn [conn]
+      (with-applied-sample-app
+        (fn []
+          (let [ec2-client (sync/ec2-client)]
+            (try
+              (sync/sync! conn ec2-client)
+              (let [db           (d/db conn)
+                    new-children (query/new-children-by-parent db)
+                    flagged-ids  (into #{}
+                                        (mapcat (fn [children] (map :resource/id children)))
+                                        (vals new-children))]
+                (testing "no Terraform-managed security group rule is flagged as new-child drift on its security group"
+                  (doseq [id ["aws_security_group_rule.ssh_open_ingress"
+                              "aws_security_group_rule.https_only_ingress"
+                              "aws_security_group_rule.reachability_open_egress"
+                              "aws_security_group_rule.reachability_open_ingress"
+                              "aws_security_group_rule.reachability_restricted_egress"]]
+                    (is (not (contains? flagged-ids id)) (str id " should not be flagged as new-child drift"))))
+                (testing "no Terraform-managed route is flagged as new-child drift on its route table"
+                  (doseq [id ["aws_route.rt_a_igw" "aws_route.rt_a_pcx" "aws_route.rt_b_pcx"]]
+                    (is (not (contains? flagged-ids id)) (str id " should not be flagged as new-child drift"))))
+                (testing "GET /drift reports no new_children for any managed security group"
+                  (let [drifted (get (json/parse-string (:body (query/drift-endpoint conn))) "drifted")]
+                    (doseq [entry drifted]
+                      (when (= "aws_security_group" (get entry "type"))
+                        (is (not (contains? entry "new_children"))
+                            (str (get entry "id") " should have no new_children")))))))
+              (finally
+                (aws/stop ec2-client)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Drift: a Terraform-managed resource changed out-of-band (issue #27)
@@ -331,6 +385,14 @@
 ;; "unmatched by Sync at all"; `aws_route_table_association` and
 ;; `aws_iam_role_policy_attachment` (both reliably id/composite-matched)
 ;; are the trustworthy cases here.
+;;
+;; The same unmatched-by-Sync root cause also means every Terraform-
+;; managed SG rule/route gets (once, then perpetually re-matched)
+;; misread as a *new* out-of-band child too, not just a removed one -
+;; `query.clj`'s `new-children-by-parent` excludes both types entirely
+;; for exactly this reason (`new-child-detection-gap-types`); see
+;; `sync-does-not-flag-terraform-managed-sg-rules-or-routes-as-new-child-
+;; drift` below for the regression test covering that half.
 ;; ---------------------------------------------------------------------------
 
 (defn- subnet-id-by-name

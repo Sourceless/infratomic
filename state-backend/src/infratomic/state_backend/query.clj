@@ -182,29 +182,71 @@
 
 (defn- children-by-parent
   "Map of parent entity id -> list of pulled child summaries
-  (`resource-summary-pattern`), across every `child-parent-joins` entry,
-  for children matching `child-where` (see `joined-children`). A child
-  under two different parents (`aws_route_table_association`'s two FK
-  entries) appears independently in each parent's own list."
-  [db child-where]
-  (->> child-parent-joins
-       (mapcat #(joined-children db % child-where))
-       (group-by first)
-       (into {} (map (fn [[parent-e pairs]]
-                        [parent-e (mapv (comp #(d/pull db resource-summary-pattern %) second) pairs)])))))
+  (`resource-summary-pattern`), across every entry of `joins` (defaults to
+  `child-parent-joins`), for children matching `child-where` (see
+  `joined-children`). A child under two different parents
+  (`aws_route_table_association`'s two FK entries) appears independently
+  in each parent's own list."
+  ([db child-where] (children-by-parent db child-where child-parent-joins))
+  ([db child-where joins]
+   (->> joins
+        (mapcat #(joined-children db % child-where))
+        (group-by first)
+        (into {} (map (fn [[parent-e pairs]]
+                         [parent-e (mapv (comp #(d/pull db resource-summary-pattern %) second) pairs)]))))))
+
+(def ^:private new-child-detection-gap-types
+  "`:child-type`s excluded from `new-children-by-parent`'s traversal of
+  `child-parent-joins` - `\"aws_security_group_rule\"` and
+  `\"aws_route\"` - though both remain covered everywhere else
+  (`removed-children-by-parent`, `security-groups-with-port-22-open`,
+  etc.). Root cause (`sync.clj`'s `sync-present-types` docstring):
+  Terraform's own `\"id\"` for both types is a different id space than
+  the AWS id Sync observes, so `existing-match` can never match a
+  Terraform-managed instance of either type back to itself. Left
+  ungated this doesn't just degrade the removed-child marker (already
+  documented) - it also means `resource-tx`'s `nil? match` branch treats
+  *every* live, unmodified, correctly-`terraform apply`'d rule/route
+  Sync observes as unmatched, producing a permanent Discovered-Resource
+  duplicate of that same rule/route (re-matched and upserted in place,
+  never multiplying further, on every later pass, by its own synthesized
+  id). Without this exclusion, `new-children-by-parent` would pick up
+  that duplicate and misreport it as new-child drift on the real,
+  unmodified managed parent forever - not an occasional false positive,
+  but permanent noise on every correctly-applied security group/route
+  table in the system (issue #32 code review finding). Excluding these
+  two types here trades a known false negative (a genuinely hand-added
+  out-of-band rule/route also goes undetected, since Sync cannot tell it
+  apart from a Terraform-managed one at the id level either) for
+  eliminating that permanent false positive - the same trade-off
+  `sync-present-types` already makes for the removed-child half. A real
+  fix would mean composite-matching security group rules by
+  `(security_group_id, protocol, from_port, to_port, cidr/source_sg)`
+  and routes by `(route_table_id, destination_cidr_block)`, the same way
+  `aws_iam_role_policy_attachment` is composite-matched - out of scope
+  here (would mean redesigning `existing-match`'s core id-based
+  matching, see `sync.clj`)."
+  #{"aws_security_group_rule" "aws_route"})
 
 (defn new-children-by-parent
   "Map of managed-parent entity id -> list of its new out-of-band
   children (`children-by-parent`, `resource-summary-pattern`-shaped): for
-  each `child-parent-joins` entry, every child entity of `:child-type`
-  joined to a managed parent whose own `:resource/managed?` is `false` -
-  i.e. a Discovered Resource `resource-tx`'s already-shipped `nil? match`
-  branch produced, purely read back here at query time (no Sync write-path
-  change is needed for this half of the feature - see design.md). A
-  Terraform-managed child with the same FK shape is exactly what Terraform
-  expects to exist, not new-child drift."
+  each `child-parent-joins` entry not in `new-child-detection-gap-types`,
+  every child entity of `:child-type` joined to a managed parent whose
+  own `:resource/managed?` is `false` - i.e. a Discovered Resource
+  `resource-tx`'s already-shipped `nil? match` branch produced, purely
+  read back here at query time (no Sync write-path change is needed for
+  this half of the feature - see design.md). A Terraform-managed child
+  with the same FK shape is exactly what Terraform expects to exist, not
+  new-child drift. `aws_security_group_rule`/`aws_route` are excluded
+  entirely (`new-child-detection-gap-types`) - a pre-existing Sync
+  id-matching gap for those two types means this Rule cannot reliably
+  distinguish a Terraform-managed instance from a genuinely new
+  out-of-band one, and reporting every already-managed instance as new
+  would be worse than reporting none."
   [db]
-  (children-by-parent db '[[?child-e :resource/managed? false]]))
+  (children-by-parent db '[[?child-e :resource/managed? false]]
+                       (remove #(contains? new-child-detection-gap-types (:child-type %)) child-parent-joins)))
 
 (defn removed-children-by-parent
   "Map of managed-parent entity id -> list of its managed children that

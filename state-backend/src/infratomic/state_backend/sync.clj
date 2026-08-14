@@ -441,8 +441,20 @@
   `:resource/sync-present? false` on every Terraform-managed instance of
   these two types on every Sync pass, regardless of whether it was
   actually removed - a false-positive source this mechanism inherits
-  rather than introduces. `aws_route_table_association` and
-  `aws_iam_role_policy_attachment` (composite-matched) are unaffected."
+  rather than introduces.
+
+  The consequence isn't limited to that marker: since `existing-match`
+  never matches a Terraform-managed rule/route to itself either,
+  `resource-tx`'s `nil? match` branch treats every one of them as
+  unmatched too, on every pass - each producing (once, then perpetually
+  re-matched and upserted in place by its own synthesized id) a
+  permanent duplicate Discovered entity with `:resource/managed? false`.
+  `query.clj`'s `new-children-by-parent` excludes both types entirely
+  (`new-child-detection-gap-types`) precisely so that duplicate is never
+  read back as new-child drift on the real, unmodified managed parent -
+  see that var's docstring for the full trade-off. `aws_route_table_association`
+  and `aws_iam_role_policy_attachment` (composite-matched) are unaffected
+  by any of this."
   #{"aws_security_group_rule" "aws_route" "aws_route_table_association" "aws_iam_role_policy_attachment"})
 
 (defn- resource-key
@@ -570,6 +582,7 @@
 
           :else
           {:tx-data (into [(merge {:resource/id                 id
+                                    :resource/type               type
                                     :resource/last-write-source  :sync}
                                    marker
                                    (db/resource-attr-tx type attributes))]

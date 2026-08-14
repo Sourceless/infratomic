@@ -218,7 +218,15 @@
   [children]
   (into #{} (map :resource/id) children))
 
-(deftest new-children-by-parent-flags-a-hand-added-security-group-rule
+;; `aws_security_group_rule` and `aws_route` are excluded entirely from
+;; new-child detection (`new-child-detection-gap-types`) - a pre-existing
+;; Sync id-matching gap (`sync.clj`'s `sync-present-types` docstring) means
+;; a hand-added rule/route is indistinguishable, at the id level, from an
+;; already Terraform-managed one, so this Rule cannot reliably flag either.
+;; The two tests below assert the exclusion holds even for what would
+;; otherwise look like a genuinely new out-of-band child.
+
+(deftest new-children-by-parent-does-not-flag-a-hand-added-security-group-rule-known-gap
   (let [conn (fresh-conn)]
     (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})]))
     (let [db0 (d/db conn)
@@ -228,8 +236,7 @@
       (d/transact conn {:tx-data tx-data}))
     (let [db     (d/db conn)
           parent (eid-by-ident db :aws-security-group/id "sg-1")]
-      (is (= #{"aws_security_group_rule.discovered-sgr-1"}
-             (child-ids (get (query/new-children-by-parent db) parent)))))))
+      (is (empty? (child-ids (get (query/new-children-by-parent db) parent)))))))
 
 (deftest new-children-by-parent-does-not-flag-a-terraform-managed-child
   (let [conn (fresh-conn)]
@@ -238,7 +245,38 @@
                                                      {"security_group_id" "sg-1" "from_port" 22 "to_port" 22})]))
     (is (empty? (query/new-children-by-parent (d/db conn))))))
 
-(deftest new-children-by-parent-flags-a-hand-added-route
+;; Code-review regression (issue #32 PR #36, Finding 1): the tests above
+;; use hand-constructed, self-consistent ids on both the "managed" and
+;; "observed" sides, which can't reproduce the real id-space mismatch
+;; between Terraform's own `aws_security_group_rule` id (e.g.
+;; `"sgrule-1"`, written via `POST /state`) and the AWS
+;; `SecurityGroupRuleId` Sync actually observes (`sync.clj`'s
+;; `sync-present-types` docstring). This test reproduces that mismatch
+;; directly: a Terraform-managed rule stored under its own Terraform id,
+;; then re-observed by Sync under a *different* (real) AWS id - exactly
+;; what happens against real AWS/LocalStack on every Sync pass. Before the
+;; fix, this produced a permanent Discovered-Resource duplicate that got
+;; misreported as new-child drift on the rule's own real, unmodified
+;; managed parent.
+(deftest new-children-by-parent-does-not-flag-a-terraform-managed-security-group-rule-despite-the-sync-id-mismatch
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})
+                                           (resource "aws_security_group_rule" "ssh_open_ingress"
+                                                     {"id" "sgrule-1" "security_group_id" "sg-1"
+                                                      "from_port" 22 "to_port" 22})]))
+    (let [db0 (d/db conn)
+          ;; Sync observes the same rule's live attributes, but under AWS's
+          ;; own id ("sgr-aws-1"), never Terraform's own ("sgrule-1").
+          {:keys [tx-data outcome]} (sync/resource-tx db0 "aws_security_group_rule" "sgr-aws-1"
+                                                        {"id" "sgr-aws-1" "security_group_id" "sg-1"
+                                                         "from_port" 22 "to_port" 22})]
+      (is (= :discovered outcome))
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-security-group/id "sg-1")]
+      (is (empty? (child-ids (get (query/new-children-by-parent db) parent)))))))
+
+(deftest new-children-by-parent-does-not-flag-a-hand-added-route-known-gap
   (let [conn (fresh-conn)]
     (handler/post-state conn (state-body [(resource "aws_route_table" "rt_a" {"id" "rt-1"})]))
     (let [db0 (d/db conn)
@@ -248,8 +286,7 @@
       (d/transact conn {:tx-data tx-data}))
     (let [db     (d/db conn)
           parent (eid-by-ident db :aws-route-table/id "rt-1")]
-      (is (= #{"aws_route.discovered-rt-1-10.0.0.0/16"}
-             (child-ids (get (query/new-children-by-parent db) parent)))))))
+      (is (empty? (child-ids (get (query/new-children-by-parent db) parent)))))))
 
 (deftest new-children-by-parent-flags-a-hand-added-association-under-both-parents
   (let [conn (fresh-conn)]
@@ -358,13 +395,19 @@
 ;; present only when a parent actually has one or the other.
 ;; ---------------------------------------------------------------------------
 
+;; Uses `aws_iam_role_policy_attachment`, not `aws_security_group_rule`
+;; (unlike this test pre-review): the latter is one of the two types
+;; `new-child-detection-gap-types` excludes entirely (see
+;; `new-children-by-parent-does-not-flag-a-hand-added-security-group-rule-
+;; known-gap` above), so it can no longer exercise the "new_children
+;; present" half of this shape test.
 (deftest drift-endpoint-includes-new-children-only-when-present
   (let [conn (fresh-conn)]
-    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})]))
+    (handler/post-state conn (state-body [(resource "aws_iam_role" "lambda_exec" {"name" "lambda-exec"})]))
     (let [db0 (d/db conn)
-          {:keys [tx-data]} (sync/resource-tx db0 "aws_security_group_rule" "sgr-1"
-                                               {"id" "sgr-1" "security_group_id" "sg-1"
-                                                "from_port" 22 "to_port" 22})]
+          {:keys [tx-data]}
+          (sync/resource-tx db0 "aws_iam_role_policy_attachment" nil
+                             {"role" "lambda-exec" "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"})]
       (d/transact conn {:tx-data tx-data}))
     (let [response (query/drift-endpoint conn)
           body     (json/parse-string (:body response))
@@ -372,8 +415,10 @@
       (is (= 200 (:status response)))
       (is (= 1 (count drifted)))
       (let [entry (first drifted)]
-        (is (= "aws_security_group.ssh_open" (get entry "id")))
-        (is (= [{"type" "aws_security_group_rule" "id" "aws_security_group_rule.discovered-sgr-1"}]
+        (is (= "aws_iam_role.lambda_exec" (get entry "id")))
+        (is (= [{"type" "aws_iam_role_policy_attachment"
+                 "id"   (str "aws_iam_role_policy_attachment.discovered-lambda-exec-"
+                             "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")}]
                (get entry "new_children")))
         (is (not (contains? entry "removed_children")))))))
 
