@@ -210,9 +210,29 @@
   either type by composite key (`db/resource-composite-key`), not by
   Terraform's own `\"id\"` (a different id space from what Sync observes -
   see ADR-0006), so `resource-tx`'s `nil? match` branch is only ever
-  reached for a genuinely new, out-of-band instance."
+  reached for a genuinely new, out-of-band instance.
+
+  A Discovered child whose `:resource/sync-present?` is currently `false`
+  is excluded (issue #32 PR #36 round-4 review fix): every child type
+  `child-parent-joins` covers is one of `sync.clj`'s `sync-present-types`,
+  and `resource-tx`'s `nil?`/`false? managed?` branches now assert
+  `:resource/sync-present? true` on a fresh or re-observed Discovered
+  child of a covered type on every pass that finds it, exactly like an
+  already-managed match already did - so once a later full Sync pass
+  (`missing-child-tx`, now also covering Discovered resources via
+  `db/resource-ids-by-type`) no longer observes a previously-flagged
+  out-of-band child, its marker flips to `false` and it drops out of this
+  map, self-clearing the new-child drift signal instead of reporting it
+  forever. A child whose marker is absent (no covering Sync pass has run
+  since it was discovered) is still included - it was, by definition, just
+  observed by `resource-tx`'s own `nil? match` branch this pass, which
+  itself now sets the marker `true`, so an absent marker in practice only
+  ever describes a brand-new-this-pass discovery reached through some
+  other path than a live `sync!` run (e.g. a hermetic test transacting a
+  Discovered entity directly)."
   [db]
-  (children-by-parent db '[[?child-e :resource/managed? false]]))
+  (children-by-parent db '[[?child-e :resource/managed? false]
+                            (not [?child-e :resource/sync-present? false])]))
 
 (defn removed-children-by-parent
   "Map of managed-parent entity id -> list of its managed children that

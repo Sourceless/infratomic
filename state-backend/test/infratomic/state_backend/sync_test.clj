@@ -716,6 +716,104 @@
     (is (seq (#'sync/missing-child-tx db "aws_security_group_rule" #{})))))
 
 ;; ---------------------------------------------------------------------------
+;; Presence tracking for Discovered (not just Terraform-managed) resources
+;; of a covered type (issue #32 PR #36 round-4 review fix): without this, a
+;; Discovered child the new-child detection mechanism itself creates never
+;; had its own presence tracked, so query.clj's `new-children-by-parent`
+;; could never learn it had genuinely disappeared and kept reporting it
+;; forever. `resource-tx`'s `nil? match` and `false? managed?` branches now
+;; also assert `:resource/sync-present? true` for a `sync-present-types`
+;; type, and `missing-child-tx` (via `db/resource-ids-by-type`, no longer
+;; managed-only) now marks a stored-but-unobserved Discovered entity of a
+;; covered type `false` too, exactly as it already did for a
+;; Terraform-managed one.
+;; ---------------------------------------------------------------------------
+
+(deftest resource-tx-a-freshly-discovered-covered-child-is-marked-sync-present
+  (let [conn (fresh-conn)
+        db   (d/db conn)
+        {:keys [tx-data outcome]}
+        (sync/resource-tx db "aws_security_group_rule" "sgr-1"
+                           {"id" "sgr-1" "security_group_id" "sg-1"
+                            "type" "ingress" "protocol" "tcp"
+                            "from_port" 22 "to_port" 22
+                            "cidr_blocks" ["0.0.0.0/0"]})]
+    (is (= :discovered outcome))
+    (d/transact conn {:tx-data tx-data})
+    (let [db'    (d/db conn)
+          eid    (eid-by-aws-id db' :aws-security-group-rule/id "sgr-1")
+          pulled (d/pull db' [:resource/sync-present?] eid)]
+      (is (= true (:resource/sync-present? pulled))))))
+
+(deftest resource-tx-a-freshly-discovered-uncovered-type-is-not-marked-sync-present
+  (let [conn (fresh-conn)
+        db   (d/db conn)
+        {:keys [tx-data outcome]} (sync/resource-tx db "aws_security_group" "sg-999" {"id" "sg-999" "vpc_id" "vpc-1"})]
+    (is (= :discovered outcome))
+    (d/transact conn {:tx-data tx-data})
+    (let [db'    (d/db conn)
+          eid    (eid-by-aws-id db' :aws-security-group/id "sg-999")
+          pulled (d/pull db' [:resource/sync-present?] eid)]
+      (is (nil? (:resource/sync-present? pulled))))))
+
+(deftest missing-child-tx-flags-a-discovered-covered-child-that-later-disappears
+  (let [conn (fresh-conn)
+        db0  (d/db conn)
+        {:keys [tx-data]}
+        (sync/resource-tx db0 "aws_security_group_rule" "sgr-1"
+                           {"id" "sgr-1" "security_group_id" "sg-1"
+                            "type" "ingress" "protocol" "tcp"
+                            "from_port" 22 "to_port" 22
+                            "cidr_blocks" ["0.0.0.0/0"]})]
+    (d/transact conn {:tx-data tx-data})
+    (is (seq (#'sync/missing-child-tx (d/db conn) "aws_security_group_rule" #{})))))
+
+(deftest missing-child-tx-does-not-flag-a-still-observed-discovered-covered-child
+  (let [conn (fresh-conn)
+        db0  (d/db conn)
+        {:keys [tx-data]}
+        (sync/resource-tx db0 "aws_security_group_rule" "sgr-1"
+                           {"id" "sgr-1" "security_group_id" "sg-1"
+                            "type" "ingress" "protocol" "tcp"
+                            "from_port" 22 "to_port" 22
+                            "cidr_blocks" ["0.0.0.0/0"]})]
+    (d/transact conn {:tx-data tx-data})
+    (let [db            (d/db conn)
+          observed-keys #{(#'sync/resource-key "aws_security_group_rule"
+                            {"id" "sgr-1" "security_group_id" "sg-1"
+                             "type" "ingress" "protocol" "tcp"
+                             "from_port" 22 "to_port" 22
+                             "cidr_blocks" ["0.0.0.0/0"]})}]
+      (is (empty? (#'sync/missing-child-tx db "aws_security_group_rule" observed-keys))))))
+
+(deftest resource-tx-re-observing-a-disappeared-then-reappeared-discovered-child-reasserts-sync-present-true
+  (let [conn (fresh-conn)
+        db0  (d/db conn)
+        {:keys [tx-data]}
+        (sync/resource-tx db0 "aws_security_group_rule" "sgr-1"
+                           {"id" "sgr-1" "security_group_id" "sg-1"
+                            "type" "ingress" "protocol" "tcp"
+                            "from_port" 22 "to_port" 22
+                            "cidr_blocks" ["0.0.0.0/0"]})]
+    (d/transact conn {:tx-data tx-data})
+    (d/transact conn {:tx-data (#'sync/missing-child-tx (d/db conn) "aws_security_group_rule" #{})})
+    (let [db1                    (d/db conn)
+          eid                    (eid-by-aws-id db1 :aws-security-group-rule/id "sgr-1")
+          pulled-before-reappear (d/pull db1 [:resource/sync-present?] eid)]
+      (is (= false (:resource/sync-present? pulled-before-reappear)))
+      (let [{:keys [tx-data outcome]}
+            (sync/resource-tx db1 "aws_security_group_rule" "sgr-1"
+                               {"id" "sgr-1" "security_group_id" "sg-1"
+                                "type" "ingress" "protocol" "tcp"
+                                "from_port" 22 "to_port" 22
+                                "cidr_blocks" ["0.0.0.0/0"]})]
+        (is (= :updated outcome))
+        (d/transact conn {:tx-data tx-data})
+        (let [db2    (d/db conn)
+              pulled (d/pull db2 [:resource/sync-present?] eid)]
+          (is (= true (:resource/sync-present? pulled))))))))
+
+;; ---------------------------------------------------------------------------
 ;; The sync-present? marker is never touched for a type outside
 ;; sync-present-types (e.g. aws_security_group is not one of the four
 ;; FK-bearing child types this mechanism covers).

@@ -234,17 +234,39 @@
                   (is (some #(= "aws_route_table_association" (:resource/type %)) (get new-children rt-c-eid))))
                 (testing "the hand-attached policy is a new child of the managed IAM role"
                   (is (some #(= "aws_iam_role_policy_attachment" (:resource/type %)) (get new-children role-eid)))))
+              ;; Round-4 review Finding 1 regression: revert every out-of-band
+              ;; change and confirm a further Sync pass clears the new-child
+              ;; drift signal instead of reporting it forever -
+              ;; `new-children-by-parent`'s own `:resource/sync-present?`
+              ;; filtering, backed by `missing-child-tx` now also covering
+              ;; Discovered resources of a covered type
+              ;; (`db/resource-ids-by-type`, no longer managed-only).
+              (aws/invoke ec2-client {:op :RevokeSecurityGroupIngress
+                                        :request {:GroupId sg-id
+                                                  :IpPermissions [{:IpProtocol "tcp" :FromPort 22 :ToPort 22
+                                                                    :IpRanges [{:CidrIp "0.0.0.0/0"}]}]}})
+              (aws/invoke iam-client {:op :DetachRolePolicy
+                                        :request {:RoleName role-name
+                                                  :PolicyArn "arn:aws:iam::aws:policy/ReadOnlyAccess"}})
+              (aws/invoke ec2-client {:op :DeleteRoute
+                                        :request {:RouteTableId rt-a-id :DestinationCidrBlock "198.51.100.0/24"}})
+              (aws/invoke ec2-client {:op :DisassociateRouteTable :request {:AssociationId assoc-id}})
+              (let [_        (sync/sync! conn ec2-client)
+                    db       (d/db conn)
+                    sg-eid   (eid-by-aws-id db :aws-security-group/id sg-id)
+                    rt-a-eid (eid-by-aws-id db :aws-route-table/id rt-a-id)
+                    rt-c-eid (eid-by-aws-id db :aws-route-table/id rt-c-id)
+                    role-eid (ffirst (d/q '[:find ?e :in $ ?name :where [?e :aws-iam-role/name ?name]] db role-name))
+                    new-children (query/new-children-by-parent db)]
+                (testing "the reverted ingress rule no longer flags the security group as having a new child"
+                  (is (not (some #(= "aws_security_group_rule" (:resource/type %)) (get new-children sg-eid)))))
+                (testing "the reverted route no longer flags the route table as having a new child"
+                  (is (not (some #(= "aws_route" (:resource/type %)) (get new-children rt-a-eid)))))
+                (testing "the reverted association no longer flags the route table as having a new child"
+                  (is (not (some #(= "aws_route_table_association" (:resource/type %)) (get new-children rt-c-eid)))))
+                (testing "the reverted policy attachment no longer flags the role as having a new child"
+                  (is (not (some #(= "aws_iam_role_policy_attachment" (:resource/type %)) (get new-children role-eid))))))
               (finally
-                (aws/invoke ec2-client {:op :RevokeSecurityGroupIngress
-                                          :request {:GroupId sg-id
-                                                    :IpPermissions [{:IpProtocol "tcp" :FromPort 22 :ToPort 22
-                                                                      :IpRanges [{:CidrIp "0.0.0.0/0"}]}]}})
-                (aws/invoke iam-client {:op :DetachRolePolicy
-                                          :request {:RoleName role-name
-                                                    :PolicyArn "arn:aws:iam::aws:policy/ReadOnlyAccess"}})
-                (aws/invoke ec2-client {:op :DeleteRoute
-                                          :request {:RouteTableId rt-a-id :DestinationCidrBlock "198.51.100.0/24"}})
-                (aws/invoke ec2-client {:op :DisassociateRouteTable :request {:AssociationId assoc-id}})
                 (aws/invoke ec2-client {:op :DeleteSubnet :request {:SubnetId subnet-id}})
                 (aws/stop ec2-client)
                 (aws/stop iam-client)))))))))

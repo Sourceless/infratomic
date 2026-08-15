@@ -112,7 +112,7 @@
 ;; Composite-key matching (ADR-0006, issue #32 PR #36 round-2 review) - the
 ;; three FK-bearing child types Sync can't reliably match a Terraform-managed
 ;; instance of by a single AWS-assigned id, so `sync.clj`'s `existing-match`
-;; and this namespace's `managed-resource-ids-by-type` both match by a
+;; and this namespace's `resource-ids-by-type` both match by a
 ;; composite attribute tuple instead. Single source of truth for that tuple's
 ;; shape, shared by both namespaces, so they can never drift out of sync with
 ;; each other.
@@ -177,7 +177,7 @@
 (def composite-keyed-types
   "The types `resource-composite-key` returns a non-nil key for - matched by
   that composite key (`sync.clj`'s `existing-match`, this namespace's
-  `managed-resource-ids-by-type`) rather than a single AWS-assigned id."
+  `resource-ids-by-type`) rather than a single AWS-assigned id."
   #{"aws_iam_role_policy_attachment" "aws_route" "aws_security_group_rule"})
 
 (def id-space-mismatched-types
@@ -741,63 +741,69 @@
   (reconstruct-attributes type (d/pull db resource-pull-pattern eid)))
 
 (defn- resource-eids-of-type
-  "Entity ids of every resource of `type` currently in the database -
-  every one (`managed-only?` false) or Terraform-managed only
-  (`managed-only?` true, excluding Discovered Resources)."
-  [db type managed-only?]
-  (map first
-       (if managed-only?
-         (d/q '[:find ?e :in $ ?type :where [?e :resource/type ?type] [?e :resource/managed? true]] db type)
-         (d/q '[:find ?e :in $ ?type :where [?e :resource/type ?type]] db type))))
+  "Entity ids of every resource of `type` currently in the database,
+  Terraform-managed and Discovered alike."
+  [db type]
+  (map first (d/q '[:find ?e :in $ ?type :where [?e :resource/type ?type]] db type)))
 
 (defn- composite-key-index
-  "Map of `resource-composite-key` value -> entity id, across every
-  (`managed-only?` true) or every (`managed-only?` false) resource entity
-  of `type` currently in the database - the shared implementation behind
-  `managed-resource-ids-by-type` and `resource-ids-by-composite-key`."
-  [db type managed-only?]
+  "Map of `resource-composite-key` value -> entity id, across every resource
+  entity of `type` (Terraform-managed and Discovered alike) currently in
+  the database - the shared implementation behind `resource-ids-by-type`
+  and `resource-ids-by-composite-key`."
+  [db type]
   (into {}
         (map (fn [eid] [(resource-composite-key type (stored-attributes db eid type)) eid]))
-        (resource-eids-of-type db type managed-only?)))
+        (resource-eids-of-type db type)))
 
-(defn managed-resource-ids-by-type
-  "Map of AWS-identifying value -> entity id, for every Terraform-managed
-  (`:resource/managed? true`) resource of `type` currently in the
-  database - keyed by `resource-composite-key`'s value for a
-  `composite-keyed-types` type (`aws_iam_role_policy_attachment`,
-  `aws_route`, `aws_security_group_rule`), or by that type's modeled
-  `\"id\"` attribute's value (e.g. `:aws-security-group/id`) otherwise.
-  `nil` for a type with no modeled `\"id\"` attribute and no composite key
-  either. Used by Sync's removed-child presence-marker step (`sync.clj`'s
-  `sync!`/`missing-child-tx`) to diff a full pass's observed AWS
-  ids/composite-keys against what's currently stored, for each of the four
-  FK-bearing child types the removed-child drift mechanism covers."
+(defn resource-ids-by-type
+  "Map of AWS-identifying value -> entity id, for every resource of `type`
+  currently in the database, Terraform-managed *and* Discovered alike -
+  keyed by `resource-composite-key`'s value for a `composite-keyed-types`
+  type (`aws_iam_role_policy_attachment`, `aws_route`,
+  `aws_security_group_rule`), or by that type's modeled `\"id\"`
+  attribute's value (e.g. `:aws-security-group/id`) otherwise. `nil` for a
+  type with no modeled `\"id\"` attribute and no composite key either.
+
+  Used by Sync's presence-marker step (`sync.clj`'s `sync!`/
+  `missing-child-tx`) to diff a full pass's observed AWS ids/composite-keys
+  against what's currently stored, for each of the four FK-bearing child
+  types the presence-marker mechanism covers. Deliberately not
+  managed-only (issue #32 PR #36 round-4 review fix, this fn's predecessor
+  `managed-resource-ids-by-type` was): a Discovered child the new-child
+  detection mechanism itself creates (`sync.clj`'s `resource-tx`, `nil?
+  match`/`false? managed?` branches, both of which now also assert
+  `:resource/sync-present? true` for a `sync-present-types` type on every
+  pass that (re-)observes it - see that fn's docstring) needs its own
+  presence tracked the same way a Terraform-managed instance's already
+  was, or `query.clj`'s `new-children-by-parent` can never learn that a
+  previously new-child-flagged Discovered child has genuinely gone
+  missing, and would keep reporting it forever (see that fn's own
+  `:resource/sync-present?` filtering fix)."
   [db type]
   (if (contains? composite-keyed-types type)
-    (composite-key-index db type true)
+    (composite-key-index db type)
     (when-let [ident (get-in resource-schema [type "id" :ident])]
       (into {}
             (d/q '[:find ?v ?e
                    :in $ ?type ?ident
                    :where
                    [?e :resource/type ?type]
-                   [?e :resource/managed? true]
                    [?e ?ident ?v]]
                  db type ident)))))
 
 (defn resource-ids-by-composite-key
   "Map of `resource-composite-key` value -> entity id, across every resource
   entity of a `composite-keyed-types` `type` currently in the database -
-  Terraform-managed *and* Discovered alike (unlike
-  `managed-resource-ids-by-type`, which is managed-only). Used by
-  `sync.clj`'s `existing-match` to find the entity (if any) an observed
-  resource of a composite-keyed type matches, whether it's an
-  already-managed instance (issue #32 PR #36 round-2 fix) or a
-  previously-Discovered one (so re-observing it updates in place rather
-  than duplicating, the same guarantee `existing-match`'s id-ident branch
-  already gives every other type)."
+  Terraform-managed *and* Discovered alike. Used by `sync.clj`'s
+  `existing-match` to find the entity (if any) an observed resource of a
+  composite-keyed type matches, whether it's an already-managed instance
+  (issue #32 PR #36 round-2 fix) or a previously-Discovered one (so
+  re-observing it updates in place rather than duplicating, the same
+  guarantee `existing-match`'s id-ident branch already gives every other
+  type)."
   [db type]
-  (composite-key-index db type false))
+  (composite-key-index db type))
 
 (defn- many-keys
   "Set of `type`'s Terraform attribute keys (`resource-schema` keys, not

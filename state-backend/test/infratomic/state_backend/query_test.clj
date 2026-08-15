@@ -345,6 +345,68 @@
                     "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")}
              (child-ids (get (query/new-children-by-parent db) parent)))))))
 
+;; ---------------------------------------------------------------------------
+;; New-child drift self-clears once the out-of-band child is later removed
+;; (issue #32 PR #36 round-4 review Finding 1): before this fix,
+;; `new-children-by-parent` was a pure `:resource/managed? false` join with
+;; no freshness dimension at all, so once a hand-added child was ever
+;; discovered, it stayed flagged forever even after being removed
+;; out-of-band and a further Sync pass no longer observing it -
+;; `resource-tx`'s `nil?`/`false? managed?` branches now also assert
+;; `:resource/sync-present? true` on a covered-type Discovered child (see
+;; that fn's docstring), so a later `missing-child-tx` pass that doesn't
+;; observe it can flip that marker `false`, which `new-children-by-parent`
+;; now filters out - symmetric to how `removed-children-by-parent` already
+;; self-clears on reappearance.
+;; ---------------------------------------------------------------------------
+
+(deftest new-children-by-parent-no-longer-flags-a-child-that-later-disappears
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data]} (sync/resource-tx db0 "aws_security_group_rule" "sgr-1"
+                                               {"id" "sgr-1" "security_group_id" "sg-1"
+                                                "type" "ingress" "protocol" "tcp"
+                                                "from_port" 22 "to_port" 22
+                                                "cidr_blocks" ["0.0.0.0/0"]})]
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-security-group/id "sg-1")]
+      (is (= #{"aws_security_group_rule.discovered-sgr-1"}
+             (child-ids (get (query/new-children-by-parent db) parent))))
+      ;; A further full Sync pass no longer observes the rule (it was
+      ;; removed out-of-band) - `missing-child-tx` marks the Discovered
+      ;; entity's presence false, exactly as it already would for a
+      ;; Terraform-managed one.
+      (d/transact conn {:tx-data (#'sync/missing-child-tx (d/db conn) "aws_security_group_rule" #{})}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-security-group/id "sg-1")]
+      (is (empty? (child-ids (get (query/new-children-by-parent db) parent)))))))
+
+(deftest new-children-by-parent-flags-again-if-the-disappeared-child-reappears
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_iam_role" "lambda_exec" {"name" "lambda-exec"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data]}
+          (sync/resource-tx db0 "aws_iam_role_policy_attachment" nil
+                             {"role" "lambda-exec" "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"})]
+      (d/transact conn {:tx-data tx-data}))
+    (d/transact conn {:tx-data (#'sync/missing-child-tx (d/db conn) "aws_iam_role_policy_attachment" #{})})
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-iam-role/name "lambda-exec")]
+      (is (empty? (child-ids (get (query/new-children-by-parent db) parent)))))
+    (let [db1 (d/db conn)
+          {:keys [tx-data outcome]}
+          (sync/resource-tx db1 "aws_iam_role_policy_attachment" nil
+                             {"role" "lambda-exec" "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"})]
+      (is (= :updated outcome))
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-iam-role/name "lambda-exec")]
+      (is (= #{(str "aws_iam_role_policy_attachment.discovered-lambda-exec-"
+                    "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")}
+             (child-ids (get (query/new-children-by-parent db) parent)))))))
+
 (deftest removed-children-by-parent-flags-a-missing-managed-security-group-rule
   (let [conn (fresh-conn)]
     (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})

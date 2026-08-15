@@ -146,3 +146,35 @@ own follow-on findings (the composite key must never replace the stored
 `"id"` value itself, and `comparable-attributes` needed a matching fix for
 an `aws_route`-specific empty-string-vs-absent representation mismatch
 this fix exposed, both discovered fixing this gap).
+
+## Update (issue #32 PR #36 round-4 review): new-child drift now also self-clears, via the same marker
+
+Round-3's fix made new-child/removed-child detection correct for an
+*unmodified* resource. It missed a distinct case, caught in round-4
+review and reproduced live against LocalStack: once a genuinely new
+out-of-band child was discovered and flagged as new-child drift, removing
+that child out-of-band and running Sync again never cleared the flag -
+`new-children-by-parent` was a pure `:resource/managed? false` join with
+no freshness dimension, and this ADR's presence marker was, as originally
+scoped, written only for Terraform-managed matches (`resource-tx`'s
+`:else` branch) - a Discovered child the new-child mechanism itself
+creates never had its own presence tracked at all, so nothing could ever
+tell `new-children-by-parent` it had genuinely disappeared.
+
+Fixed by extending this ADR's own mechanism to the Discovered side, not by
+adding a new one: `resource-tx`'s `nil? match` (fresh discovery) and
+`false? managed?` (re-observed, already-Discovered) branches now also
+assert `:resource/sync-present? true` for a `sync-present-types` type, on
+every pass that (re-)observes the child - exactly the assertion the
+Terraform-managed branch already made. `db.clj`'s `managed-resource-ids-by-type`
+(renamed `resource-ids-by-type`) is no longer managed-only, so
+`missing-child-tx`'s observed-vs-stored diff now also marks a
+stored-but-unobserved Discovered entity of a covered type
+`:resource/sync-present? false`. `new-children-by-parent` filters out any
+child whose marker is `false`, so a new-child-flagged Discovered entity
+that a later full Sync pass no longer observes drops out of the map -
+self-clearing, symmetric to how the removed-child Rule already self-clears
+on reappearance. Nothing about the hard constraint changes: a Discovered
+child's own entity and attributes are still never retracted or altered by
+this - `:resource/sync-present?` remains the only thing ever written, now
+just written for both kinds of match, not one.

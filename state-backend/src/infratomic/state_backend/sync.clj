@@ -31,14 +31,16 @@
      an update to a previously-discovered entity, or (issue #27) a
      diff-gated update to a Terraform-managed entity whose observed live
      value has drifted out-of-band, tagging the write
-     `:resource/last-write-source :sync`. A Terraform-managed match whose
-     live value hasn't changed gets no write at all, except (issue #32) to
-     reassert `:resource/sync-present? true` if a prior Sync pass had
-     flagged it removed (`resource-tx`'s reappearance fix); a
-     Terraform-managed, `sync-present-types`-covered resource stored but
-     not observed this pass instead gets `:resource/sync-present? false`
-     asserted (`missing-child-tx`), the removed-child drift signal
-     `query.clj`'s removed-child Rule reads."
+     `:resource/last-write-source :sync`. A `sync-present-types`-covered
+     match (Terraform-managed *or* Discovered - issue #32 PR #36 round-4
+     review fix) whose live value hasn't changed gets no write at all,
+     except (issue #32) to reassert `:resource/sync-present? true` if a
+     prior Sync pass had flagged it missing (`resource-tx`'s reappearance
+     fix); a `sync-present-types`-covered resource of either kind stored
+     but not observed this pass instead gets `:resource/sync-present?
+     false` asserted (`missing-child-tx`), the removed-child (managed) or
+     no-longer-new-child (Discovered) drift signal `query.clj`'s
+     removed-child and new-child Rules read, respectively."
   (:require [cheshire.core :as json]
             [clojure.core.async :as a]
             [clojure.string :as str]
@@ -437,10 +439,15 @@
   (get-in db/resource-schema [type "id" :ident]))
 
 (def ^:private sync-present-types
-  "The four FK-bearing child types the removed-child drift mechanism
-  covers (design.md's `child-parent-joins`, minus the second
+  "The four FK-bearing child types the presence-marker mechanism covers
+  (design.md's `child-parent-joins`, minus the second
   `aws_route_table_association` FK entry, which is the same type) - the
-  only types `:resource/sync-present?` is ever written for.
+  only types `:resource/sync-present?` is ever written for, for a match of
+  either kind, Terraform-managed (removed-child drift, `query.clj`'s
+  `removed-children-by-parent`) or Discovered (new-child drift
+  self-clearing once a previously-flagged out-of-band child genuinely
+  disappears, `query.clj`'s `new-children-by-parent` - issue #32 PR #36
+  round-4 review fix).
 
   All four are now reliably matched back to their Terraform-managed
   instance on every Sync pass: `aws_route_table_association` by its own
@@ -458,7 +465,7 @@
   "The value that identifies one observed AWS resource of `type` within
   `attributes`: `db/resource-composite-key`'s value for a
   `db/composite-keyed-types` type, or its `\"id\"` otherwise - mirroring
-  `db/managed-resource-ids-by-type`'s key shape (both build it via the same
+  `db/resource-ids-by-type`'s key shape (both build it via the same
   `db/resource-composite-key`), so the two are directly comparable when
   diffing observed vs. stored ids/keys."
   [type attributes]
@@ -589,17 +596,32 @@
   `\"id\"` from the diff itself, so a mismatched-but-otherwise-identical id
   alone never reaches this branch in the first place. Every tx-map this fn
   produces sets `:resource/last-write-source :sync` - the only write path
-  (besides `POST /state`) a Resource entity ever goes through. Returns
+  (besides `POST /state`) a Resource entity ever goes through.
+
+  The `nil? match` and `false? managed?` (already-Discovered) branches also
+  assert `:resource/sync-present? true` for a `sync-present-types` type
+  (issue #32 PR #36 round-4 review fix) - not just the Terraform-managed
+  `:else` branch, which already did. Without this, a Discovered child the
+  new-child detection mechanism itself creates here never had its own
+  presence tracked, so `missing-child-tx`/`db/resource-ids-by-type`
+  (both broadened by this same fix to cover Discovered entities, not just
+  managed ones) had nothing to ever mark `false` on it once it genuinely
+  disappeared from a later `describe-all` pass - `query.clj`'s
+  `new-children-by-parent` would then report it as new-child drift
+  forever, even after the out-of-band child was itself removed. Returns
   `{:tx-data [...] :outcome (:discovered :updated :drifted
   :skipped-already-managed)}`."
   [db type aws-id attributes]
-  (let [match (existing-match db type aws-id attributes)]
+  (let [match    (existing-match db type aws-id attributes)
+        covered? (contains? sync-present-types type)
+        marker   (when covered? {:resource/sync-present? true})]
     (cond
       (nil? match)
       {:tx-data [(merge {:resource/id                 (discovered-resource-id type aws-id attributes)
                           :resource/type               type
                           :resource/managed?           false
                           :resource/last-write-source  :sync}
+                         marker
                          (db/resource-attr-tx type attributes))]
        :outcome :discovered}
 
@@ -609,6 +631,7 @@
                                   :resource/type               type
                                   :resource/managed?           false
                                   :resource/last-write-source  :sync}
+                                 marker
                                  (db/resource-attr-tx type attributes))]
                          (db/resource-upsert-retractions db id type attributes))
          :outcome :updated})
@@ -618,8 +641,6 @@
             eid         (:db/id match)
             stored      (db/stored-attributes db eid type)
             unchanged?  (= (db/comparable-attributes type stored) (db/comparable-attributes type attributes))
-            covered?    (contains? sync-present-types type)
-            marker      (when covered? {:resource/sync-present? true})
             reappeared? (and covered? (false? (:resource/sync-present? match)))
             writable    (writable-attributes type attributes)]
         (cond
@@ -658,30 +679,35 @@
         resources))
 
 (defn- missing-child-tx
-  "Tx-data asserting `:resource/sync-present? false` on every
-  Terraform-managed resource of covered child `type` that's currently
-  stored (`db/managed-resource-ids-by-type`) but wasn't among this Sync
-  pass's observed ids for that type (`observed-keys`) - the removed-child
-  half of issue #32's presence marker (design.md's \"removed-child
-  detection\" decision). The reciprocal `true` assertion for an observed,
-  matched resource happens per-resource, inside `resource-tx` itself (see
-  that fn's docstring) - this step only ever needs to mark absence, since
-  a resource `resource-tx` never saw this run was, by definition, not
-  observed."
+  "Tx-data asserting `:resource/sync-present? false` on every resource of
+  covered child `type` (Terraform-managed *and* Discovered alike, issue #32
+  PR #36 round-4 review fix - see `db/resource-ids-by-type`'s docstring)
+  that's currently stored (`db/resource-ids-by-type`) but wasn't among this
+  Sync pass's observed ids for that type (`observed-keys`) - the
+  removed/gone-missing half of issue #32's presence marker (design.md's
+  \"removed-child detection\" decision, broadened to cover a Discovered
+  child too so `new-children-by-parent` can self-clear once one it flagged
+  genuinely disappears, symmetric to how `removed-children-by-parent`
+  already self-clears on reappearance). The reciprocal `true` assertion
+  for an observed, matched resource happens per-resource, inside
+  `resource-tx` itself (see that fn's docstring) - this step only ever
+  needs to mark absence, since a resource `resource-tx` never saw this run
+  was, by definition, not observed."
   [db type observed-keys]
   (into []
         (keep (fn [[k eid]]
                 (when-not (contains? observed-keys k)
                   [:db/add eid :resource/sync-present? false])))
-        (db/managed-resource-ids-by-type db type)))
+        (db/resource-ids-by-type db type)))
 
 (defn sync!
   "The full Sync pass (design.md's \"POST /sync endpoint shape\"): fetches
   and translates every modeled type from LocalStack (`describe-all`),
   decides each one's ingestion outcome against a single db snapshot
   (`resource-tx`), transacts every resulting tx-data plus the
-  removed-child presence-marker tx-data (`missing-child-tx`, one per
-  `sync-present-types` type) in one transaction. Returns a summary map:
+  presence-marker tx-data (`missing-child-tx`, one per `sync-present-types`
+  type, covering both Terraform-managed and Discovered resources of that
+  type - issue #32 PR #36 round-4 review fix) in one transaction. Returns a summary map:
   `{:discovered [{:type :id} ...] :updated [{:type :id} ...] :drifted
   [{:type :id} ...] :skipped-already-managed <count>}`. `:drifted` lists
   each Terraform-managed resource whose observed live value differed from
