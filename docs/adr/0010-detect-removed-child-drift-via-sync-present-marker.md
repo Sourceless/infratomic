@@ -117,3 +117,32 @@ Trade-offs accepted:
   `:resource/sync-present? false` fact - accepted as correct semantics
   (the drift is genuinely relevant to both relationships), not a
   deduplication bug to fix.
+
+## Update (issue #32 PR #36 round-2 review): the `aws_security_group_rule`/`aws_route` id-matching gap this ADR shipped with is now fixed
+
+This ADR's "every Terraform-managed entity whose AWS id Sync observed this
+run" wording glossed over a real gap for two of the four covered types:
+`aws_security_group_rule`/`aws_route`'s modeled `"id"` is written from two
+different id spaces depending on write path (Terraform's own
+synthetic/opaque id via `POST /state`; AWS's real observed id via Sync),
+so `existing-match`'s id-based lookup could never actually match a
+Terraform-managed instance of either type to itself - `sync!`'s
+observed-vs-stored diff step (this ADR's design) ended up marking every
+Terraform-managed instance of both types `:resource/sync-present? false`
+on every single pass, correctly removed or not, a permanent false-positive
+source this mechanism shipped with rather than caused. A parallel gap
+existed on the new-child side (`query.clj`'s `new-children-by-parent`),
+worked around in a first pass by excluding both types from new-child
+detection entirely.
+
+Both gaps are now fixed at the root: `sync.clj`'s `existing-match`
+composite-key-matches a Terraform-managed instance of either type
+(`db/resource-composite-key`, ADR-0006's update) instead of relying on the
+mismatched id, so `missing-child-tx`'s observed-vs-stored diff (and
+`new-children-by-parent`, no longer needing any exclusion) both now see an
+unmodified instance as present, as this ADR always intended. See
+ADR-0006's update and `db/id-space-mismatched-types` for the fix and its
+own follow-on findings (the composite key must never replace the stored
+`"id"` value itself, and `comparable-attributes` needed a matching fix for
+an `aws_route`-specific empty-string-vs-absent representation mismatch
+this fix exposed, both discovered fixing this gap).

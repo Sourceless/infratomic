@@ -163,17 +163,36 @@
   {"id"     (:GroupId sg)
    "vpc_id" (:VpcId sg)})
 
+(defn- all-protocols-port
+  "AWS reports `FromPort`/`ToPort` as `-1` for an all-protocols
+  (`IpProtocol` `\"-1\"`) rule (confirmed empirically against a running
+  LocalStack instance while fixing issue #32 PR #36's round-2 review -
+  ports are meaningless for this protocol, so AWS's value is a sentinel,
+  not a real port number), but Terraform's own `aws_security_group_rule`
+  convention - and this codebase's sample app - asserts `0` for both
+  instead. Left untranslated, this mismatch alone would make
+  `db/resource-composite-key` (which includes `from_port`/`to_port`) never
+  match an all-protocols rule back to its Terraform-managed instance,
+  exactly the kind of permanent false new-child/removed-child positive
+  this composite-key fix exists to eliminate - so `port` is normalized to
+  `0` here, at the translation boundary, for every all-protocols rule
+  regardless of AWS's raw value."
+  [rule port]
+  (if (= "-1" (:IpProtocol rule)) 0 port))
+
 (defn security-group-rule->attrs
   "Translates one `DescribeSecurityGroupRules` entry. `cidr_blocks` is
   present only when the rule has a CIDR (`CidrIpv4`); `source_security_group_id`
   only when it references another security group (`ReferencedGroupInfo`) -
   a rule has exactly one or the other, matching Terraform's own
   `aws_security_group_rule` shape (decompose-attributes skips absent/nil
-  keys, so omitting rather than nil-ing the other is equivalent)."
+  keys, so omitting rather than nil-ing the other is equivalent). See
+  `all-protocols-port` for `from_port`/`to_port`'s all-protocols-rule
+  normalization."
   [rule]
   (cond-> {"id"                 (:SecurityGroupRuleId rule)
-           "from_port"          (:FromPort rule)
-           "to_port"            (:ToPort rule)
+           "from_port"          (all-protocols-port rule (:FromPort rule))
+           "to_port"            (all-protocols-port rule (:ToPort rule))
            "protocol"           (:IpProtocol rule)
            "security_group_id"  (:GroupId rule)
            "type"               (if (:IsEgress rule) "egress" "ingress")}
@@ -423,85 +442,88 @@
   `aws_route_table_association` FK entry, which is the same type) - the
   only types `:resource/sync-present?` is ever written for.
 
-  Known pre-existing limitation (#26/#27, not introduced by this
-  mechanism - confirmed against a real LocalStack instance while
-  developing `sync_integration_test.clj`'s coverage of this feature):
-  `existing-match`'s id-based lookup can never actually match a
-  Terraform-managed `aws_security_group_rule` or `aws_route` instance to
-  itself. For `aws_route`, this was already known (Sync synthesizes its
-  own `\"<route_table_id>-<destination_cidr_block>\"` id, distinct from
-  Terraform's own internal route id - see
-  `sync_integration_test.clj`'s `drift-sample-app-instance!` docstring).
-  For `aws_security_group_rule`, `resource-schema`'s `\"id\"` entry is
-  written by both `POST /state` (Terraform's own synthetic rule id, e.g.
-  `\"sgrule-<n>\"`) and Sync (AWS's real `SecurityGroupRuleId`, per
-  ADR-0006) - two different id spaces sharing one modeled ident, so a
-  Terraform-managed rule's stored id is never the one Sync observes
-  either. In both cases, `missing-child-tx` ends up asserting
-  `:resource/sync-present? false` on every Terraform-managed instance of
-  these two types on every Sync pass, regardless of whether it was
-  actually removed - a false-positive source this mechanism inherits
-  rather than introduces.
-
-  The consequence isn't limited to that marker: since `existing-match`
-  never matches a Terraform-managed rule/route to itself either,
-  `resource-tx`'s `nil? match` branch treats every one of them as
-  unmatched too, on every pass - each producing (once, then perpetually
-  re-matched and upserted in place by its own synthesized id) a
-  permanent duplicate Discovered entity with `:resource/managed? false`.
-  `query.clj`'s `new-children-by-parent` excludes both types entirely
-  (`new-child-detection-gap-types`) precisely so that duplicate is never
-  read back as new-child drift on the real, unmodified managed parent -
-  see that var's docstring for the full trade-off. `aws_route_table_association`
-  and `aws_iam_role_policy_attachment` (composite-matched) are unaffected
-  by any of this."
+  All four are now reliably matched back to their Terraform-managed
+  instance on every Sync pass: `aws_route_table_association` by its own
+  AWS-assigned id (never had a gap), `aws_iam_role_policy_attachment` by
+  composite `(role, policy_arn)` key (no AWS-assigned id of its own), and
+  - as of issue #32 PR #36's round-2 fix - `aws_security_group_rule`/
+  `aws_route` by composite key too (`db/resource-composite-key`,
+  `existing-match`), working around Terraform's own `\"id\"` for both
+  types being a different id space from the AWS id Sync observes
+  (ADR-0006). See `db/id-space-mismatched-types` for how that id-space gap
+  is kept from leaking into drift comparison or write-back."
   #{"aws_security_group_rule" "aws_route" "aws_route_table_association" "aws_iam_role_policy_attachment"})
 
 (defn- resource-key
   "The value that identifies one observed AWS resource of `type` within
-  `attributes`: its `\"id\"` for an id-based type, or the `[role
-  policy_arn]` pair for `\"aws_iam_role_policy_attachment\"` (mirroring
-  `db/managed-resource-ids-by-type`'s key shape for that type, so the two
-  are directly comparable when diffing observed vs. stored ids)."
+  `attributes`: `db/resource-composite-key`'s value for a
+  `db/composite-keyed-types` type, or its `\"id\"` otherwise - mirroring
+  `db/managed-resource-ids-by-type`'s key shape (both build it via the same
+  `db/resource-composite-key`), so the two are directly comparable when
+  diffing observed vs. stored ids/keys."
   [type attributes]
-  (if (= type "aws_iam_role_policy_attachment")
-    [(get attributes "role") (get attributes "policy_arn")]
+  (if (contains? db/composite-keyed-types type)
+    (db/resource-composite-key type attributes)
     (get attributes "id")))
 
 (defn- composite-match
-  "The existing Resource entity (if any) whose
-  `:aws-iam-role-policy-attachment/role` and
-  `:aws-iam-role-policy-attachment/policy-arn` equal `role`/`policy-arn`
-  together - neither alone uniquely identifies an attachment (a role can
-  have many attachments; a policy can be attached to many roles), unlike
-  every other FK-bearing child type's single AWS-assigned id."
-  [db role policy-arn]
-  (when-let [eid (ffirst (d/q '[:find ?e
-                                 :in $ ?role ?arn
-                                 :where
-                                 [?e :aws-iam-role-policy-attachment/role ?role]
-                                 [?e :aws-iam-role-policy-attachment/policy-arn ?arn]]
-                               db role policy-arn))]
+  "The existing Resource entity (if any) whose `db/resource-composite-key`
+  equals observed `attributes`' - the match path for every
+  `db/composite-keyed-types` type (`db/resource-ids-by-composite-key`
+  scans every entity of `type`, Terraform-managed and Discovered alike, so
+  re-observing an already-Discovered instance updates it in place rather
+  than duplicating, exactly like `existing-match`'s id-ident branch gives
+  every other type)."
+  [db type attributes]
+  (when-let [eid (get (db/resource-ids-by-composite-key db type)
+                       (db/resource-composite-key type attributes))]
     (d/pull db [:db/id :resource/id :resource/managed? :resource/sync-present?] eid)))
 
-(defn- existing-match
-  "The existing Resource entity (if any), `{:db/id ... :resource/id ...
-  :resource/managed? ... :resource/sync-present? ...}`, matching this
-  observed AWS resource: for `\"aws_iam_role_policy_attachment\"`, a
-  composite `(role, policy_arn)` lookup (`composite-match`, since this
-  type has no modeled `\"id\"` of its own - see `id-ident`); for every
-  other type, a Datalog query on the modeled id ident (e.g.
-  `:aws-security-group/id ?aws-id`), not a `:resource/id` guess, since a
+(defn- id-based-match
+  "The existing Resource entity (if any) whose modeled id ident (e.g.
+  `:aws-security-group/id`) equals `aws-id`, or `nil` if `type` has no
+  modeled `\"id\"` entry at all. Not a `:resource/id` guess, since a
   Terraform-managed match's `:resource/id` is `\"<type>.<name>\"`, not the
   synthesized discovered-resource shape. `:db/id` is included so the
   Terraform-managed branch can reconstruct the match's currently stored
   attributes for the drift diff without a second lookup query."
+  [db type aws-id]
+  (when-let [ident (id-ident type)]
+    (when-let [eid (ffirst (d/q '[:find ?e :in $ ?ident ?v :where [?e ?ident ?v]] db ident aws-id))]
+      (d/pull db [:db/id :resource/id :resource/managed? :resource/sync-present?] eid))))
+
+(defn- existing-match
+  "The existing Resource entity (if any), `{:db/id ... :resource/id ...
+  :resource/managed? ... :resource/sync-present? ...}`, matching this
+  observed AWS resource:
+
+  - `db/id-space-mismatched-types` (`\"aws_route\"`,
+    `\"aws_security_group_rule\"`) - both DO have a real, AWS-assigned id
+    Sync itself writes and reuses on every later Sync
+    (`:aws-security-group-rule/id` the AWS `SecurityGroupRuleId`,
+    ADR-0006; `:aws-route/id` Sync's own synthesized
+    `route_table_id`-`destination_cidr_block`), so `id-based-match` is
+    tried *first* - this is what makes re-observing an already-Discovered
+    instance of either type update it in place rather than duplicate it,
+    exactly ADR-0006's decision, undisturbed by this fix. It only ever
+    finds a *Discovered* match though, since a Terraform-managed
+    instance's stored id is a different space entirely (`POST /state`'s
+    own synthetic/opaque id) - `composite-match` (`db/resource-composite-key`)
+    is the fallback that catches that case.
+  - Every other `db/composite-keyed-types` type
+    (`\"aws_iam_role_policy_attachment\"`) - composite-key lookup only,
+    since it has no modeled `\"id\"` of its own at all.
+  - Every other type - `id-based-match` only, unchanged."
   [db type aws-id attributes]
-  (if (= type "aws_iam_role_policy_attachment")
-    (composite-match db (get attributes "role") (get attributes "policy_arn"))
-    (when-let [ident (id-ident type)]
-      (when-let [eid (ffirst (d/q '[:find ?e :in $ ?ident ?v :where [?e ?ident ?v]] db ident aws-id))]
-        (d/pull db [:db/id :resource/id :resource/managed? :resource/sync-present?] eid)))))
+  (cond
+    (contains? db/id-space-mismatched-types type)
+    (or (id-based-match db type aws-id) (composite-match db type attributes))
+
+    (contains? db/composite-keyed-types type)
+    (composite-match db type attributes)
+
+    :else
+    (id-based-match db type aws-id)))
 
 (defn- discovered-resource-id
   "Synthesizes a `:resource/id` for a fresh Discovered Resource of `type`:
@@ -513,6 +535,28 @@
   (if (= type "aws_iam_role_policy_attachment")
     (str type ".discovered-" (get attributes "role") "-" (get attributes "policy_arn"))
     (str type ".discovered-" aws-id)))
+
+(defn- writable-attributes
+  "`attributes`, with `\"id\"` dropped for a `db/id-space-mismatched-types`
+  type (`aws_route`, `aws_security_group_rule`) - used only for the write
+  path back to an *already Terraform-managed* match (`resource-tx`'s
+  `:else` branch). Terraform's own `\"id\"` for these two types is a
+  different id space from the AWS id Sync observes (see
+  `db/resource-composite-key`'s docstring); omitting the key from the
+  tx-map entirely leaves the entity's existing (Terraform-asserted)
+  `:aws-route/id`/`:aws-security-group-rule/id` datom untouched (Datomic
+  never retracts a cardinality-one attribute just because a later
+  transaction doesn't mention it), so `GET /state` keeps reporting exactly
+  what Terraform itself last asserted, forever - even when this same write
+  is asserting a real drifted value for some *other* attribute (e.g.
+  `gateway_id`). Every other write path (`resource-tx`'s `nil? match` and
+  `false? managed?` branches, both for Discovered Resources with no
+  Terraform-asserted id to protect) uses `attributes` as observed,
+  unmodified."
+  [type attributes]
+  (if (contains? db/id-space-mismatched-types type)
+    (dissoc attributes "id")
+    attributes))
 
 (defn resource-tx
   "The ingestion decision (design.md's \"Resource matching\") for one
@@ -538,11 +582,16 @@
   marker would otherwise never clear); different -> the same
   upsert-in-place tx-data an already-discovered match gets (plus
   `:resource/sync-present? true` for a `sync-present-types` type),
-  tagging `:resource/last-write-source :sync`, outcome `:drifted`. Every
-  tx-map this fn produces sets `:resource/last-write-source :sync` - the
-  only write path (besides `POST /state`) a Resource entity ever goes
-  through. Returns `{:tx-data [...] :outcome (:discovered :updated
-  :drifted :skipped-already-managed)}`."
+  tagging `:resource/last-write-source :sync`, outcome `:drifted` - for a
+  `db/id-space-mismatched-types` type, this write omits `\"id\"` entirely
+  (`writable-attributes`), so it never overwrites Terraform's own asserted
+  id with AWS's observed one; `db/comparable-attributes` already excludes
+  `\"id\"` from the diff itself, so a mismatched-but-otherwise-identical id
+  alone never reaches this branch in the first place. Every tx-map this fn
+  produces sets `:resource/last-write-source :sync` - the only write path
+  (besides `POST /state`) a Resource entity ever goes through. Returns
+  `{:tx-data [...] :outcome (:discovered :updated :drifted
+  :skipped-already-managed)}`."
   [db type aws-id attributes]
   (let [match (existing-match db type aws-id attributes)]
     (cond
@@ -571,7 +620,8 @@
             unchanged?  (= (db/comparable-attributes type stored) (db/comparable-attributes type attributes))
             covered?    (contains? sync-present-types type)
             marker      (when covered? {:resource/sync-present? true})
-            reappeared? (and covered? (false? (:resource/sync-present? match)))]
+            reappeared? (and covered? (false? (:resource/sync-present? match)))
+            writable    (writable-attributes type attributes)]
         (cond
           (and unchanged? (not reappeared?))
           {:tx-data [] :outcome :skipped-already-managed}
@@ -585,8 +635,8 @@
                                     :resource/type               type
                                     :resource/last-write-source  :sync}
                                    marker
-                                   (db/resource-attr-tx type attributes))]
-                           (db/resource-upsert-retractions db id type attributes))
+                                   (db/resource-attr-tx type writable))]
+                           (db/resource-upsert-retractions db id type writable))
            :outcome :drifted})))))
 
 ;; ---------------------------------------------------------------------------
