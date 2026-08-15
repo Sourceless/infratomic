@@ -174,9 +174,23 @@
               :else
               (terraform! ["apply" "tfplan"]))))))))
 
+(defn- print-child-refs
+  "Prints `children` (a `[{\"type\" ... \"id\" ...} ...]` list, possibly
+  absent/empty) indented under `label` - used by `print-discovered-resource`
+  to surface a drifted parent's `new_children`/`removed_children` (issue
+  #32), a no-op when `children` is absent or empty so an entry with
+  neither key present prints exactly as before."
+  [label children]
+  (when (seq children)
+    (println (format "      %s:" label))
+    (doseq [{:strs [type id]} children]
+      (println (format "        - %s (%s)" id type)))))
+
 (defn- print-discovered-resource
-  [{:strs [type id]}]
-  (println (format "  - %s (%s)" id type)))
+  [{:strs [type id new_children removed_children]}]
+  (println (format "  - %s (%s)" id type))
+  (print-child-refs "new children" new_children)
+  (print-child-refs "removed children" removed_children))
 
 (defn- trigger-sync
   "POST an empty body to `sync-url` and return either `{:discovered [...]
@@ -249,8 +263,13 @@
   a `200` response with the expected shape is ever treated as a confirmed
   result, so a malformed or non-2xx response from the Drift Check endpoint
   is reported as a failure rather than silently treated as \"no drift\".
-  Public (rather than `defn-`) so it's directly testable, mirroring
-  `db.clj`'s `backfill-managed-flag!`."
+  Validates only the top-level `drifted` array's presence - each entry's
+  own shape (a plain `{\"type\" \"id\"}` pair, optionally with
+  `\"new_children\"`/`\"removed_children\"` keys, issue #32) is passed
+  through as-is to `drift-check!`/`print-discovered-resource`, which read
+  those keys defensively rather than requiring them. Public (rather than
+  `defn-`) so it's directly testable, mirroring `db.clj`'s
+  `backfill-managed-flag!`."
   [drift-url]
   (try
     (let [{:keys [status body]} (get-json drift-url)]

@@ -108,6 +108,92 @@
    {"role"       {:ident :aws-iam-role-policy-attachment/role :value-type :db.type/string}
     "policy_arn" {:ident :aws-iam-role-policy-attachment/policy-arn :value-type :db.type/string}}})
 
+;; ---------------------------------------------------------------------------
+;; Composite-key matching (ADR-0006, issue #32 PR #36 round-2 review) - the
+;; three FK-bearing child types Sync can't reliably match a Terraform-managed
+;; instance of by a single AWS-assigned id, so `sync.clj`'s `existing-match`
+;; and this namespace's `resource-ids-by-type` both match by a
+;; composite attribute tuple instead. Single source of truth for that tuple's
+;; shape, shared by both namespaces, so they can never drift out of sync with
+;; each other.
+;; ---------------------------------------------------------------------------
+
+(defn resource-composite-key
+  "The composite matching key for a resource of `type` given its
+  Terraform-attribute-shaped `attributes` map (the same shape
+  `resource-attr-tx`/`stored-attributes`/`sync.clj`'s `*->attrs` translation
+  functions all produce) - `nil` for a type matched by a single AWS-assigned
+  id instead (see `sync.clj`'s `existing-match`/`id-ident`).
+
+  `\"aws_iam_role_policy_attachment\"`: `[role policy_arn]` - this type has
+  no AWS-assigned id of its own at all (Terraform's own provider models
+  none either).
+
+  `\"aws_route\"`: `[route_table_id destination_cidr_block]` - AWS enforces
+  at most one route per destination CIDR per route table, and this is
+  exactly the pair `sync.clj`'s `route->attrs` already synthesizes its own
+  `\"id\"` from. Terraform's own `aws_route` id is a different,
+  provider-internal value from what Sync observes, so it can't be the match
+  key for an already Terraform-managed instance (a pre-existing gap, not
+  introduced here).
+
+  `\"aws_security_group_rule\"`: `[security_group_id type protocol from_port
+  to_port cidr_blocks source_security_group_id]`, with `cidr_blocks`
+  canonicalized to a sorted vector so pull-order (stored side) and
+  observation-order (Sync side) compare equal. Terraform's own id for this
+  type is a client-side provider hash (`\"sgrule-<n>\"`), AWS's is its own
+  `SecurityGroupRuleId` (ADR-0006) - two different spaces sharing one
+  modeled `\"id\"` ident, so, like `aws_route`, it can't be the match key
+  either. ADR-0006 previously rejected this same tuple shape for
+  *Discovered*-resource re-identification (collision risk between two
+  distinct discovered rules sharing a shape); that concern doesn't apply
+  here, where the tuple is used purely as an internal match key for a rule
+  Terraform itself already declares - see the updated ADR-0006.
+
+  In both `aws_route`/`aws_security_group_rule`'s cases, the type still has
+  a real, Terraform-facing `\"id\"` attribute `GET /state` must keep
+  returning unchanged - this composite key is used only for *matching*, never
+  written in place of it (see `sync.clj`'s `resource-tx` and
+  `id-space-mismatched-types`)."
+  [type attributes]
+  (case type
+    "aws_iam_role_policy_attachment"
+    [(get attributes "role") (get attributes "policy_arn")]
+
+    "aws_route"
+    [(get attributes "route_table_id") (get attributes "destination_cidr_block")]
+
+    "aws_security_group_rule"
+    [(get attributes "security_group_id")
+     (get attributes "type")
+     (get attributes "protocol")
+     (get attributes "from_port")
+     (get attributes "to_port")
+     (vec (sort (get attributes "cidr_blocks")))
+     (get attributes "source_security_group_id")]
+
+    nil))
+
+(def composite-keyed-types
+  "The types `resource-composite-key` returns a non-nil key for - matched by
+  that composite key (`sync.clj`'s `existing-match`, this namespace's
+  `resource-ids-by-type`) rather than a single AWS-assigned id."
+  #{"aws_iam_role_policy_attachment" "aws_route" "aws_security_group_rule"})
+
+(def id-space-mismatched-types
+  "The subset of `composite-keyed-types` that, unlike
+  `\"aws_iam_role_policy_attachment\"` (no `\"id\"` attribute at all), DO
+  have a modeled `\"id\"` attribute Terraform itself asserts and `GET
+  /state` must keep returning unchanged - but whose value is written from
+  two different id spaces depending on write path (Terraform's own
+  synthetic/opaque id via `POST /state`; AWS's own real id via Sync), so it
+  is never a reliable match key (see `resource-composite-key`) and must
+  never be treated as a drift-comparable attribute either
+  (`comparable-attributes` excludes `\"id\"` for these types) or be
+  overwritten by a Sync write to an already Terraform-managed match
+  (`sync.clj`'s `resource-tx` strips it before writing back)."
+  #{"aws_route" "aws_security_group_rule"})
+
 (defn- modeled-schema-entry
   [{:keys [ident value-type cardinality]}]
   {:db/ident       ident
@@ -155,6 +241,10 @@
      :db/valueType   :db.type/keyword
      :db/cardinality :db.cardinality/one
      :db/doc         ":terraform for a write made via POST /state (resource->tx); :sync for a write made by Sync (resource-tx), whether creating a newly Discovered Resource or updating a resource (discovered or Terraform-managed) whose observed live value changed. Set on every resource-entity write, by both write paths. Read by the drift Rule (query.clj) to find managed resources whose most recent write source is :sync, and via d/history/d/as-of to locate the most recent :terraform-sourced write to compare against."}
+    {:db/ident       :resource/sync-present?
+     :db/valueType   :db.type/boolean
+     :db/cardinality :db.cardinality/one
+     :db/doc         "Whether Sync's most recent full pass, for a Terraform-managed resource of one of the four FK-bearing child types this drift mechanism covers (aws_security_group_rule, aws_route, aws_route_table_association, aws_iam_role_policy_attachment), found this resource still present in AWS. true when found; false when Sync ran and did not find it (removed-child drift); absent when no Sync run covering this type has happened since the resource was created/last matched. Never read by GET /state reconstruction (absent from resource-pull-pattern) - purely a query-time signal for the removed-child Rule (query.clj)."}
     {:db/ident       :resource/type
      :db/valueType   :db.type/string
      :db/cardinality :db.cardinality/one
@@ -650,6 +740,71 @@
   [db eid type]
   (reconstruct-attributes type (d/pull db resource-pull-pattern eid)))
 
+(defn- resource-eids-of-type
+  "Entity ids of every resource of `type` currently in the database,
+  Terraform-managed and Discovered alike."
+  [db type]
+  (map first (d/q '[:find ?e :in $ ?type :where [?e :resource/type ?type]] db type)))
+
+(defn- composite-key-index
+  "Map of `resource-composite-key` value -> entity id, across every resource
+  entity of `type` (Terraform-managed and Discovered alike) currently in
+  the database - the shared implementation behind `resource-ids-by-type`
+  and `resource-ids-by-composite-key`."
+  [db type]
+  (into {}
+        (map (fn [eid] [(resource-composite-key type (stored-attributes db eid type)) eid]))
+        (resource-eids-of-type db type)))
+
+(defn resource-ids-by-type
+  "Map of AWS-identifying value -> entity id, for every resource of `type`
+  currently in the database, Terraform-managed *and* Discovered alike -
+  keyed by `resource-composite-key`'s value for a `composite-keyed-types`
+  type (`aws_iam_role_policy_attachment`, `aws_route`,
+  `aws_security_group_rule`), or by that type's modeled `\"id\"`
+  attribute's value (e.g. `:aws-security-group/id`) otherwise. `nil` for a
+  type with no modeled `\"id\"` attribute and no composite key either.
+
+  Used by Sync's presence-marker step (`sync.clj`'s `sync!`/
+  `missing-child-tx`) to diff a full pass's observed AWS ids/composite-keys
+  against what's currently stored, for each of the four FK-bearing child
+  types the presence-marker mechanism covers. Deliberately not
+  managed-only (issue #32 PR #36 round-4 review fix, this fn's predecessor
+  `managed-resource-ids-by-type` was): a Discovered child the new-child
+  detection mechanism itself creates (`sync.clj`'s `resource-tx`, `nil?
+  match`/`false? managed?` branches, both of which now also assert
+  `:resource/sync-present? true` for a `sync-present-types` type on every
+  pass that (re-)observes it - see that fn's docstring) needs its own
+  presence tracked the same way a Terraform-managed instance's already
+  was, or `query.clj`'s `new-children-by-parent` can never learn that a
+  previously new-child-flagged Discovered child has genuinely gone
+  missing, and would keep reporting it forever (see that fn's own
+  `:resource/sync-present?` filtering fix)."
+  [db type]
+  (if (contains? composite-keyed-types type)
+    (composite-key-index db type)
+    (when-let [ident (get-in resource-schema [type "id" :ident])]
+      (into {}
+            (d/q '[:find ?v ?e
+                   :in $ ?type ?ident
+                   :where
+                   [?e :resource/type ?type]
+                   [?e ?ident ?v]]
+                 db type ident)))))
+
+(defn resource-ids-by-composite-key
+  "Map of `resource-composite-key` value -> entity id, across every resource
+  entity of a `composite-keyed-types` `type` currently in the database -
+  Terraform-managed *and* Discovered alike. Used by `sync.clj`'s
+  `existing-match` to find the entity (if any) an observed resource of a
+  composite-keyed type matches, whether it's an already-managed instance
+  (issue #32 PR #36 round-2 fix) or a previously-Discovered one (so
+  re-observing it updates in place rather than duplicating, the same
+  guarantee `existing-match`'s id-ident branch already gives every other
+  type)."
+  [db type]
+  (composite-key-index db type))
+
 (defn- many-keys
   "Set of `type`'s Terraform attribute keys (`resource-schema` keys, not
   idents) that are modeled cardinality-many - e.g. `vpc_security_group_ids`
@@ -694,6 +849,23 @@
   empty collection (e.g. an instance with no security groups) would
   otherwise keep it.
 
+  An empty-*string*-valued key is dropped the same way, for a distinct
+  reason discovered fixing issue #32 PR #36's round-2 review (confirmed
+  against a real `terraform apply` + `GET /state`): Terraform's classic
+  `aws_route` resource schema posts `\"\"` (empty string), not `null`, for
+  every one of a route's unused \"target\" attributes (e.g.
+  `vpc_peering_connection_id` on a gateway-only route) - `decompose-attributes`
+  *does* write a real datom for an empty string (only `nil` is skipped),
+  so the *reconstructed*/Terraform-sourced side of the comparison ends up
+  with a genuine `\"\"` value for that key, while Sync's own translation
+  (`sync.clj`'s `route->attrs`) maps the same unused target to `nil`
+  (dropped above) - an asymmetry that, left uncorrected, would make every
+  `aws_route` compare unequal on every single Sync pass, purely from this
+  representational mismatch, not any real observed change. This was
+  unreachable before `aws_route` was composite-matched (`existing-match`
+  never found a match to compare against in the first place), so it went
+  undetected until this fix exposed it.
+
   Normalizing cardinality-many values matters because Datomic stores each
   value of a cardinality-many modeled attribute as an independent datom
   with no preserved ordinal: `d/pull`'s return order for the reconstructed
@@ -703,15 +875,26 @@
   sorting both sides into the same order first, plain `=`/`not=` would
   falsely report drift on every sync run for any resource with 2+ values in
   such an attribute, purely because of pull-vs-observed ordering - not any
-  real change."
+  real change.
+
+  `\"id\"` itself is dropped for `id-space-mismatched-types` (`aws_route`,
+  `aws_security_group_rule`): both types' modeled `\"id\"` is written from
+  two different id spaces depending on write path (Terraform's own
+  synthetic/opaque id via `POST /state`; AWS's real observed id via Sync -
+  see `resource-composite-key`), so it would otherwise compare unequal on
+  every single Sync pass regardless of whether the resource actually
+  changed - a permanent false-drift source distinct from (and in addition
+  to) the ordering/nil/empty-collection ones above."
   [type attrs]
-  (let [keys (set (keys (get resource-schema type)))
+  (let [keys (cond-> (set (keys (get resource-schema type)))
+               (contains? id-space-mismatched-types type) (disj "id"))
         many (many-keys type)]
     (into {}
           (comp
            (filter (fn [[k v]] (and (contains? keys k)
                                      (some? v)
-                                     (not (and (coll? v) (empty? v))))))
+                                     (not (and (coll? v) (empty? v)))
+                                     (not (and (string? v) (empty? v))))))
            (map (fn [[k v]]
                   (if (and (contains? many k) (coll? v))
                     [k (vec (sort-by str v))]

@@ -90,3 +90,35 @@
 
 (deftest drift-check-on-a-failed-request-exits-nonzero
   (is (not= 0 (main/drift-check! "http://localhost:1/drift"))))
+
+;; ---------------------------------------------------------------------------
+;; new_children/removed_children (issue #32) - trigger-drift-check/drift-check!
+;; pass these through and print them without breaking, whether or not a
+;; given entry carries them.
+;; ---------------------------------------------------------------------------
+
+(def ^:private drift-response-with-children-body
+  (str "{\"drifted\": ["
+       "{\"type\": \"aws_security_group\", \"id\": \"aws_security_group.ssh_open\", "
+       "\"new_children\": [{\"type\": \"aws_security_group_rule\", \"id\": \"aws_security_group_rule.discovered-sgr-1\"}]},"
+       "{\"type\": \"aws_route_table\", \"id\": \"aws_route_table.rt_a\", "
+       "\"removed_children\": [{\"type\": \"aws_route\", \"id\": \"aws_route.rt_a_igw\"}]},"
+       "{\"type\": \"aws_instance\", \"id\": \"aws_instance.web\"}"
+       "]}"))
+
+(deftest trigger-drift-check-parses-a-response-with-new-and-removed-children-present
+  (with-drift-endpoint 200 drift-response-with-children-body
+    (fn [url]
+      (let [{:keys [drifted]} (main/trigger-drift-check url)]
+        (is (= 3 (count drifted)))
+        (is (= [{"type" "aws_security_group_rule" "id" "aws_security_group_rule.discovered-sgr-1"}]
+               (get (first drifted) "new_children")))
+        (is (= [{"type" "aws_route" "id" "aws_route.rt_a_igw"}]
+               (get (second drifted) "removed_children")))
+        (is (not (contains? (nth drifted 2) "new_children")))
+        (is (not (contains? (nth drifted 2) "removed_children")))))))
+
+(deftest drift-check-with-new-and-removed-children-present-exits-nonzero-and-does-not-throw
+  (with-drift-endpoint 200 drift-response-with-children-body
+    (fn [url]
+      (is (not= 0 (main/drift-check! url))))))

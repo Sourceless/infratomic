@@ -127,30 +127,150 @@
                  [?e :resource/last-write-source :terraform ?tx true]]
                (d/history db) eid)))
 
-(defn drifted-resources
-  "The drift Rule (design.md's \"Drift Rule: d/history-based comparison\"):
-  every managed resource whose most recent write source is `:sync` and
-  whose current live attribute values differ from the values Terraform
-  last asserted for it - i.e. its stored attributes as of the most recent
-  transaction where `:resource/last-write-source` held `:terraform`
-  (found via `d/history`/`d/as-of`, `db/stored-attributes` reconstructing
-  both sides so the diff compares like-for-like). Both sides are narrowed
-  to `type`'s modeled keys via `db/comparable-attributes` before
-  comparing - Sync never observes (and so never legitimately drifts) a
-  resource's other, unmodeled attributes, and a Terraform-managed
-  resource's own unrelated `:sync` update already retracts its stored
-  generic sub-entities (`resource-upsert-retractions`), which would
-  otherwise make an unscoped full-attribute-map comparison see permanent
-  phantom drift on those unrelated keys forever after. A resource whose
-  most recent write is `:terraform` (never drifted), or one with no prior
-  `:terraform`-sourced write at all (Sync-discovered, never
-  Terraform-managed), is never included - matching the resource-sync/
-  drift-detection specs' scenarios.
+;; ---------------------------------------------------------------------------
+;; New-child / removed-child drift (issue #32): a single data-driven
+;; child/parent join table, generalizing security-groups-with-port-22-open's
+;; single hard-coded join across every FK-bearing child type this system
+;; models, driving both directions of detection.
+;; ---------------------------------------------------------------------------
 
-  This function is query-time-only: it is deliberately **not** registered
-  in `policy.clj`'s `rules` vector, so it never runs as part of the
-  pre-apply Policy Check (see that namespace and the drift-detection
-  spec's \"excluded from the pre-apply Policy Check\" requirement)."
+(def child-parent-joins
+  "Every FK-bearing child/parent relationship the new-child and
+  removed-child drift Rules traverse (design.md's \"a single data-driven
+  child/parent join table drives both new- and removed-child detection\"
+  decision): `:child-type`/`:parent-type` are Terraform resource type
+  strings, `:fk-ident` is the child's modeled foreign-key attribute,
+  `:parent-join-ident` is the parent attribute it's compared against by
+  typed value equality. `aws_route_table_association` appears twice
+  (once per FK) - deliberately: an out-of-band association is drift on
+  *both* the route table and the subnet it names. Its `:aws-iam-role-
+  policy-attachment/role` entry is the one whose `:parent-join-ident`
+  isn't that parent type's `\"id\"` attribute (`:aws-iam-role/name`, not
+  an id) - a data difference here, not a code branch."
+  [{:child-type "aws_security_group_rule"        :fk-ident :aws-security-group-rule/security-group-id
+    :parent-type "aws_security_group"             :parent-join-ident :aws-security-group/id}
+   {:child-type "aws_route"                       :fk-ident :aws-route/route-table-id
+    :parent-type "aws_route_table"                :parent-join-ident :aws-route-table/id}
+   {:child-type "aws_route_table_association"     :fk-ident :aws-route-table-association/route-table-id
+    :parent-type "aws_route_table"                :parent-join-ident :aws-route-table/id}
+   {:child-type "aws_route_table_association"     :fk-ident :aws-route-table-association/subnet-id
+    :parent-type "aws_subnet"                      :parent-join-ident :aws-subnet/id}
+   {:child-type "aws_iam_role_policy_attachment"  :fk-ident :aws-iam-role-policy-attachment/role
+    :parent-type "aws_iam_role"                    :parent-join-ident :aws-iam-role/name}])
+
+(defn- joined-children
+  "`[?parent-e ?child-e]` pairs for one `child-parent-joins` entry: every
+  child entity of `:child-type` whose `:fk-ident` value equals a managed
+  (`:resource/managed? true`) parent entity of `:parent-type`'s
+  `:parent-join-ident` value, further restricted by `child-where` (extra
+  where clauses, as data - `:resource/managed? false` for the new-child
+  Rule, `:resource/managed? true` + `:resource/sync-present? false` for
+  the removed-child Rule). The shared low-level traversal both
+  `new-children-by-parent` and `removed-children-by-parent` parameterize
+  over `child-parent-joins`, rather than one bespoke Rule per
+  relationship."
+  [db {:keys [child-type fk-ident parent-type parent-join-ident]} child-where]
+  (d/q {:find  '[?parent-e ?child-e]
+        :in    '[$ ?child-type ?fk-ident ?parent-type ?parent-join-ident]
+        :where (into '[[?parent-e :resource/type ?parent-type]
+                        [?parent-e :resource/managed? true]
+                        [?parent-e ?parent-join-ident ?join-v]
+                        [?child-e ?fk-ident ?join-v]
+                        [?child-e :resource/type ?child-type]]
+                      child-where)}
+       db child-type fk-ident parent-type parent-join-ident))
+
+(defn- children-by-parent
+  "Map of parent entity id -> list of pulled child summaries
+  (`resource-summary-pattern`), across every entry of `joins` (defaults to
+  `child-parent-joins`), for children matching `child-where` (see
+  `joined-children`). A child under two different parents
+  (`aws_route_table_association`'s two FK entries) appears independently
+  in each parent's own list."
+  ([db child-where] (children-by-parent db child-where child-parent-joins))
+  ([db child-where joins]
+   (->> joins
+        (mapcat #(joined-children db % child-where))
+        (group-by first)
+        (into {} (map (fn [[parent-e pairs]]
+                         [parent-e (mapv (comp #(d/pull db resource-summary-pattern %) second) pairs)]))))))
+
+(defn new-children-by-parent
+  "Map of managed-parent entity id -> list of its new out-of-band
+  children (`children-by-parent`, `resource-summary-pattern`-shaped): for
+  each `child-parent-joins` entry, every child entity of `:child-type`
+  joined to a managed parent whose own `:resource/managed?` is `false` -
+  i.e. a Discovered Resource `resource-tx`'s already-shipped `nil? match`
+  branch produced, purely read back here at query time (no Sync
+  write-path change is needed for this half of the feature - see
+  design.md). A Terraform-managed child with the same FK shape is exactly
+  what Terraform expects to exist, not new-child drift - reliably true for
+  every covered type, `aws_security_group_rule`/`aws_route` included:
+  `sync.clj`'s `existing-match` matches a Terraform-managed instance of
+  either type by composite key (`db/resource-composite-key`), not by
+  Terraform's own `\"id\"` (a different id space from what Sync observes -
+  see ADR-0006), so `resource-tx`'s `nil? match` branch is only ever
+  reached for a genuinely new, out-of-band instance.
+
+  A Discovered child whose `:resource/sync-present?` is currently `false`
+  is excluded (issue #32 PR #36 round-4 review fix): every child type
+  `child-parent-joins` covers is one of `sync.clj`'s `sync-present-types`,
+  and `resource-tx`'s `nil?`/`false? managed?` branches now assert
+  `:resource/sync-present? true` on a fresh or re-observed Discovered
+  child of a covered type on every pass that finds it, exactly like an
+  already-managed match already did - so once a later full Sync pass
+  (`missing-child-tx`, now also covering Discovered resources via
+  `db/resource-ids-by-type`) no longer observes a previously-flagged
+  out-of-band child, its marker flips to `false` and it drops out of this
+  map, self-clearing the new-child drift signal instead of reporting it
+  forever. A child whose marker is absent (no covering Sync pass has run
+  since it was discovered) is still included - it was, by definition, just
+  observed by `resource-tx`'s own `nil? match` branch this pass, which
+  itself now sets the marker `true`, so an absent marker in practice only
+  ever describes a brand-new-this-pass discovery reached through some
+  other path than a live `sync!` run (e.g. a hermetic test transacting a
+  Discovered entity directly)."
+  [db]
+  (children-by-parent db '[[?child-e :resource/managed? false]
+                            (not [?child-e :resource/sync-present? false])]))
+
+(defn removed-children-by-parent
+  "Map of managed-parent entity id -> list of its managed children that
+  have gone missing out-of-band (`children-by-parent`,
+  `resource-summary-pattern`-shaped): for each `child-parent-joins` entry,
+  every managed (`:resource/managed? true`) child entity of `:child-type`
+  whose current `:resource/sync-present?` is `false` - Sync's most recent
+  full pass covering that type ran and didn't find it (see `sync.clj`'s
+  `missing-child-tx`). The child entity itself, and all of its
+  modeled/generic attribute datoms, are never touched by this mechanism -
+  `GET /state` continues to report it exactly as before for as long as it
+  stays Terraform-managed (design.md's \"removed-child detection never
+  changes what GET /state reports\" constraint)."
+  [db]
+  (children-by-parent db '[[?child-e :resource/managed? true]
+                            [?child-e :resource/sync-present? false]]))
+
+(defn- attribute-drifted-eids
+  "Entity ids of every managed resource whose most recent write source is
+  `:sync` and whose current live attribute values differ from the values
+  Terraform last asserted for it - i.e. its stored attributes as of the
+  most recent transaction where `:resource/last-write-source` held
+  `:terraform` (found via `d/history`/`d/as-of`, `db/stored-attributes`
+  reconstructing both sides so the diff compares like-for-like). Both
+  sides are narrowed to `type`'s modeled keys via `db/comparable-attributes`
+  before comparing - Sync never observes (and so never legitimately
+  drifts) a resource's other, unmodeled attributes, and a
+  Terraform-managed resource's own unrelated `:sync` update already
+  retracts its stored generic sub-entities (`resource-upsert-retractions`),
+  which would otherwise make an unscoped full-attribute-map comparison see
+  permanent phantom drift on those unrelated keys forever after. A
+  resource whose most recent write is `:terraform` (never drifted), or one
+  with no prior `:terraform`-sourced write at all (Sync-discovered, never
+  Terraform-managed), is never included - matching the resource-sync/
+  drift-detection specs' scenarios. The attribute-level half of the drift
+  Rule (design.md's \"Drift Rule: d/history-based comparison\") - see
+  `drifted-resources`, which merges this with the new-child/removed-child
+  halves (issue #32)."
   [db]
   (into []
         (keep (fn [[eid type]]
@@ -158,19 +278,54 @@
                   (let [terraform-attrs (db/comparable-attributes type (db/stored-attributes (d/as-of db tx) eid type))
                         live-attrs      (db/comparable-attributes type (db/stored-attributes db eid type))]
                     (when (not= terraform-attrs live-attrs)
-                      (d/pull db resource-summary-pattern eid))))))
+                      eid)))))
         (sync-sourced-managed-resources db)))
 
+(defn drifted-resources
+  "The drift Rule (design.md's \"Drift Rule: d/history-based comparison\"),
+  merging three independent detection mechanisms into one flat list, each
+  resource appearing at most once: plain attribute-level drift
+  (`attribute-drifted-eids`); new-child drift, a managed parent with at
+  least one out-of-band child (`new-children-by-parent`); and
+  removed-child drift, a managed parent with at least one previously-known
+  managed child Sync's most recent pass didn't find
+  (`removed-children-by-parent`) - see those fns and design.md's
+  `child-parent-joins`. A parent flagged by more than one mechanism gets
+  one entry carrying all applicable signals, not several.
+
+  This function is query-time-only: it is deliberately **not** registered
+  in `policy.clj`'s `rules` vector, so it never runs as part of the
+  pre-apply Policy Check (see that namespace and the drift-detection
+  spec's \"excluded from the pre-apply Policy Check\" requirement)."
+  [db]
+  (let [attr-eids        (attribute-drifted-eids db)
+        new-children     (new-children-by-parent db)
+        removed-children (removed-children-by-parent db)
+        all-eids         (into (into #{} attr-eids)
+                                (into (set (keys new-children)) (keys removed-children)))]
+    (into []
+          (map (fn [eid]
+                 (cond-> (d/pull db resource-summary-pattern eid)
+                   (contains? new-children eid)     (assoc :new-children (get new-children eid))
+                   (contains? removed-children eid)  (assoc :removed-children (get removed-children eid)))))
+          all-eids)))
+
 (defn- resource->json
-  [{:resource/keys [id type]}]
-  {"type" type "id" id})
+  [{:resource/keys [id type] :keys [new-children removed-children]}]
+  (cond-> {"type" type "id" id}
+    (seq new-children)     (assoc "new_children" (mapv resource->json new-children))
+    (seq removed-children) (assoc "removed_children" (mapv resource->json removed-children))))
 
 (defn drift-endpoint
   "Handle a `GET /drift` request: evaluate the drift Rule
   (`drifted-resources`) against `(d/db conn)` and respond `200` with
-  `{\"drifted\": [{\"type\" ... \"id\" ...} ...]}` (`[]` when no drift is
-  present). Read-only - never creates, modifies, or retracts any resource
-  entity or state version. Takes no request body and no query params."
+  `{\"drifted\": [{\"type\" ... \"id\" ... [\"new_children\" [...]]
+  [\"removed_children\" [...]]} ...]}` (`[]` when no drift is present) -
+  `new_children`/`removed_children` are each a list of `{\"type\" ...
+  \"id\" ...}` objects, present only when that parent has at least one
+  (issue #32). Read-only - never creates, modifies, or retracts any
+  resource entity or state version. Takes no request body and no query
+  params."
   [conn]
   {:status  200
    :headers {"Content-Type" "application/json"}

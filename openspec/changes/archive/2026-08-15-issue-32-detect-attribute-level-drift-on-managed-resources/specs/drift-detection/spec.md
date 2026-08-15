@@ -1,10 +1,4 @@
-# drift-detection Specification
-
-## Purpose
-
-Detects when a Terraform-managed resource's live value has been changed out-of-band (directly against the environment, not through Terraform), by comparing each managed resource's most recent write source against what Terraform last asserted, and exposes that as a query-time Rule and endpoint operators can check on demand.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: A query-time Rule flags drifted managed resources
 The system SHALL provide a Rule function that, given the current database value, returns every managed Resource entity whose most recent `:resource/last-write-source` write is `:sync` and whose current attribute values differ from the values Terraform last asserted (as of the most recent transaction where `:resource/last-write-source` was `:terraform`). A managed resource whose most recent write source is `:terraform`, or whose `:sync`-sourced values match what Terraform last asserted, SHALL NOT be included.
@@ -25,13 +19,6 @@ The system SHALL provide a Rule function that, given the current database value,
 - **WHEN** a Terraform-managed `aws_instance`'s security group membership (`vpc_security_group_ids`) is changed directly against the environment (not through Terraform), and Sync is run and observes the changed membership
 - **THEN** the drift Rule includes that instance in its results via this attribute-comparison mechanism, with no separate child-detection mechanism involved
 
-### Requirement: The drift Rule is excluded from the pre-apply Policy Check
-The drift Rule SHALL NOT be part of the set of Rules the Policy Check endpoint evaluates against a plan. It SHALL only ever be evaluated directly against live, already-persisted state.
-
-#### Scenario: The Policy Check response is unaffected by drift
-- **WHEN** a Terraform-managed resource currently has out-of-band drift flagged by the drift Rule, and a plan is submitted to the Policy Check endpoint
-- **THEN** the Policy Check response's Violations are unaffected by that resource's drift — drift is never reported as a Policy Check Violation
-
 ### Requirement: Drift status is queryable via a read-only endpoint
 The State Backend SHALL expose a read-only `GET /drift` endpoint that evaluates the drift Rule against current live state and returns the flagged resources, each identified by at least its type and id. A returned entry for a managed parent resource MAY additionally include a `new_children` key, a `removed_children` key, or both, each a list of `{type, id}` objects identifying new-child or removed-child drift on that parent (see the new-child and removed-child requirements below); an entry with neither key present means only plain attribute-level drift (or none) applies to that resource, preserving the existing flat `{type, id}` shape unchanged for that case. Calling this endpoint SHALL NOT create, modify, or retract any resource entity or state version.
 
@@ -51,12 +38,7 @@ The State Backend SHALL expose a read-only `GET /drift` endpoint that evaluates 
 - **WHEN** `GET /drift` is called and a managed parent resource currently has at least one managed child that has gone missing out-of-band (see the removed-child requirement below)
 - **THEN** the response includes an entry for that parent with a `removed_children` list containing that child, each identified by at least its type and id
 
-### Requirement: Terraform's last-asserted values remain recoverable after a drifting write
-A `:sync`-sourced write to a previously Terraform-managed resource SHALL NOT destroy the values Terraform last asserted for that resource; those prior values SHALL remain reconstructable via the database's history, so the drift Rule can compare against them even after the live values have been overwritten.
-
-#### Scenario: Terraform's prior value is still recoverable after drift is recorded
-- **WHEN** a Terraform-managed resource's live value is changed out-of-band and Sync records the new value
-- **THEN** the value Terraform last asserted for that resource is still recoverable from the database's history, distinct from the current live value
+## ADDED Requirements
 
 ### Requirement: A query-time Rule flags new out-of-band children of managed resources
 The system SHALL provide a Rule function that, given the current database value, returns every managed (`:resource/managed? true`) parent resource that has at least one associated child resource of a foreign-key-bearing child type - `aws_security_group_rule` (via `security_group_id`), `aws_route` (via `route_table_id`), `aws_route_table_association` (via `route_table_id` and, independently, `subnet_id`), or `aws_iam_role_policy_attachment` (via `role`, matched against the parent role's name) - where that child resource is itself a Discovered Resource (`:resource/managed? false`), joined to the parent by that child type's foreign-key attribute equalling the parent's own identifying attribute. A managed parent with no such child, or whose only children of these types are themselves Terraform-managed, SHALL NOT be included. An `aws_route` or `aws_route_table_association` entry that has no Terraform `aws_route`/`aws_route_table_association` counterpart (the AWS-implicit default local route or main-table association) SHALL NOT be treated as a child for this purpose.

@@ -182,6 +182,363 @@
       (d/transact conn {:tx-data tx-data}))
     (is (= #{"aws_instance.web"} (ids (query/drifted-resources (d/db conn)))))))
 
+;; A regression test (issue #32 task 8.5): an `aws_instance`'s
+;; `vpc_security_group_ids` membership change remains covered by the
+;; existing attribute-diff drift mechanism above, with no
+;; new-child/removed-child mechanism involved - it produces a plain entry,
+;; no `:new-children`/`:removed-children` keys at all.
+(deftest drifted-resources-vpc-security-group-ids-change-has-no-new-or-removed-children
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_instance" "web"
+                                                      {"id" "i-1" "subnet_id" "subnet-1"
+                                                       "vpc_security_group_ids" ["sg-aaa" "sg-bbb"]})]))
+    (let [db (d/db conn)
+          {:keys [tx-data outcome]}
+          (sync/resource-tx db "aws_instance" "i-1"
+                             {"id" "i-1" "subnet_id" "subnet-1"
+                              "vpc_security_group_ids" ["sg-aaa" "sg-ccc"]})]
+      (is (= :drifted outcome))
+      (d/transact conn {:tx-data tx-data}))
+    (let [[result] (query/drifted-resources (d/db conn))]
+      (is (= "aws_instance.web" (:resource/id result)))
+      (is (nil? (:new-children result)))
+      (is (nil? (:removed-children result))))))
+
+;; ---------------------------------------------------------------------------
+;; new-children-by-parent / removed-children-by-parent - the new-child and
+;; removed-child drift Rules (issue #32), generalized across every
+;; FK-bearing child type via `child-parent-joins`.
+;; ---------------------------------------------------------------------------
+
+(defn- eid-by-ident
+  [db ident value]
+  (ffirst (d/q '[:find ?e :in $ ?ident ?v :where [?e ?ident ?v]] db ident value)))
+
+(defn- child-ids
+  [children]
+  (into #{} (map :resource/id) children))
+
+;; `aws_security_group_rule` and `aws_route` are matched by composite key,
+;; not by Terraform's own `"id"` (a different id space from what Sync
+;; observes - `sync.clj`'s `db/resource-composite-key`/ADR-0006), so this
+;; Rule can reliably tell a genuinely new out-of-band rule/route apart from
+;; an already Terraform-managed one for both types too, same as every other
+;; covered type.
+
+(deftest new-children-by-parent-flags-a-hand-added-security-group-rule
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data]} (sync/resource-tx db0 "aws_security_group_rule" "sgr-1"
+                                               {"id" "sgr-1" "security_group_id" "sg-1"
+                                                "type" "ingress" "protocol" "tcp"
+                                                "from_port" 22 "to_port" 22
+                                                "cidr_blocks" ["0.0.0.0/0"]})]
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-security-group/id "sg-1")]
+      (is (= #{"aws_security_group_rule.discovered-sgr-1"}
+             (child-ids (get (query/new-children-by-parent db) parent)))))))
+
+(deftest new-children-by-parent-does-not-flag-a-terraform-managed-child
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})
+                                           (resource "aws_security_group_rule" "ssh_open_ingress"
+                                                     {"security_group_id" "sg-1" "from_port" 22 "to_port" 22})]))
+    (is (empty? (query/new-children-by-parent (d/db conn))))))
+
+;; Code-review regression (issue #32 PR #36 round-1 Finding 1, now fixed in
+;; round 2): the tests above use hand-constructed, self-consistent ids on
+;; both the "managed" and "observed" sides, which can't reproduce the real
+;; id-space mismatch between Terraform's own `aws_security_group_rule` id
+;; (e.g. `"sgrule-1"`, written via `POST /state`) and the AWS
+;; `SecurityGroupRuleId` Sync actually observes (`db/resource-composite-key`'s
+;; docstring). This test reproduces that mismatch directly: a
+;; Terraform-managed rule stored under its own Terraform id, then
+;; re-observed by Sync under a *different* (real) AWS id - exactly what
+;; happens against real AWS/LocalStack on every Sync pass. `existing-match`
+;; now finds it via composite key regardless of the id mismatch, so it's
+;; matched (not re-discovered) and never misreported as new-child drift on
+;; its own real, unmodified managed parent.
+(deftest new-children-by-parent-does-not-flag-a-terraform-managed-security-group-rule-despite-the-sync-id-mismatch
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})
+                                           (resource "aws_security_group_rule" "ssh_open_ingress"
+                                                     {"id" "sgrule-1" "security_group_id" "sg-1"
+                                                      "type" "ingress" "protocol" "tcp"
+                                                      "from_port" 22 "to_port" 22
+                                                      "cidr_blocks" ["0.0.0.0/0"]})]))
+    (let [db0 (d/db conn)
+          ;; Sync observes the same rule's live attributes, but under AWS's
+          ;; own id ("sgr-aws-1"), never Terraform's own ("sgrule-1").
+          {:keys [tx-data outcome]} (sync/resource-tx db0 "aws_security_group_rule" "sgr-aws-1"
+                                                        {"id" "sgr-aws-1" "security_group_id" "sg-1"
+                                                         "type" "ingress" "protocol" "tcp"
+                                                         "from_port" 22 "to_port" 22
+                                                         "cidr_blocks" ["0.0.0.0/0"]})]
+      (is (= :skipped-already-managed outcome))
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-security-group/id "sg-1")]
+      (is (empty? (child-ids (get (query/new-children-by-parent db) parent)))))))
+
+(deftest new-children-by-parent-flags-a-hand-added-route
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_route_table" "rt_a" {"id" "rt-1"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data]} (sync/resource-tx db0 "aws_route" "rt-1-10.0.0.0/16"
+                                               {"id" "rt-1-10.0.0.0/16" "route_table_id" "rt-1"
+                                                "destination_cidr_block" "10.0.0.0/16"})]
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-route-table/id "rt-1")]
+      (is (= #{"aws_route.discovered-rt-1-10.0.0.0/16"}
+             (child-ids (get (query/new-children-by-parent db) parent)))))))
+
+;; Code-review regression (issue #32 PR #36 round-1 Finding 1, now fixed in
+;; round 2) - the `aws_route` analogue of the SG-rule regression test above:
+;; a Terraform-managed route stored under Terraform's own internal route id,
+;; re-observed by Sync under its own synthesized (different)
+;; `"<route_table_id>-<destination_cidr_block>"` id.
+(deftest new-children-by-parent-does-not-flag-a-terraform-managed-route-despite-the-sync-id-mismatch
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_route_table" "rt_a" {"id" "rt-1"})
+                                           (resource "aws_route" "rt_a_igw"
+                                                     {"id" "route-1" "route_table_id" "rt-1"
+                                                      "destination_cidr_block" "0.0.0.0/0"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data outcome]} (sync/resource-tx db0 "aws_route" "rt-1-0.0.0.0/0"
+                                                        {"id" "rt-1-0.0.0.0/0" "route_table_id" "rt-1"
+                                                         "destination_cidr_block" "0.0.0.0/0"})]
+      (is (= :skipped-already-managed outcome))
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-route-table/id "rt-1")]
+      (is (empty? (child-ids (get (query/new-children-by-parent db) parent)))))))
+
+(deftest new-children-by-parent-flags-a-hand-added-association-under-both-parents
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_route_table" "rt_a" {"id" "rt-1"})
+                                           (resource "aws_subnet" "subnet_a" {"id" "subnet-1" "vpc_id" "vpc-1"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data]} (sync/resource-tx db0 "aws_route_table_association" "rtbassoc-1"
+                                               {"id" "rtbassoc-1" "route_table_id" "rt-1" "subnet_id" "subnet-1"})]
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          rt-eid (eid-by-ident db :aws-route-table/id "rt-1")
+          sn-eid (eid-by-ident db :aws-subnet/id "subnet-1")
+          result (query/new-children-by-parent db)]
+      (is (= #{"aws_route_table_association.discovered-rtbassoc-1"} (child-ids (get result rt-eid))))
+      (is (= #{"aws_route_table_association.discovered-rtbassoc-1"} (child-ids (get result sn-eid)))))))
+
+(deftest new-children-by-parent-flags-a-hand-attached-iam-policy
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_iam_role" "lambda_exec" {"name" "lambda-exec"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data]}
+          (sync/resource-tx db0 "aws_iam_role_policy_attachment" nil
+                             {"role" "lambda-exec" "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"})]
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-iam-role/name "lambda-exec")]
+      (is (= #{(str "aws_iam_role_policy_attachment.discovered-lambda-exec-"
+                    "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")}
+             (child-ids (get (query/new-children-by-parent db) parent)))))))
+
+;; ---------------------------------------------------------------------------
+;; New-child drift self-clears once the out-of-band child is later removed
+;; (issue #32 PR #36 round-4 review Finding 1): before this fix,
+;; `new-children-by-parent` was a pure `:resource/managed? false` join with
+;; no freshness dimension at all, so once a hand-added child was ever
+;; discovered, it stayed flagged forever even after being removed
+;; out-of-band and a further Sync pass no longer observing it -
+;; `resource-tx`'s `nil?`/`false? managed?` branches now also assert
+;; `:resource/sync-present? true` on a covered-type Discovered child (see
+;; that fn's docstring), so a later `missing-child-tx` pass that doesn't
+;; observe it can flip that marker `false`, which `new-children-by-parent`
+;; now filters out - symmetric to how `removed-children-by-parent` already
+;; self-clears on reappearance.
+;; ---------------------------------------------------------------------------
+
+(deftest new-children-by-parent-no-longer-flags-a-child-that-later-disappears
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data]} (sync/resource-tx db0 "aws_security_group_rule" "sgr-1"
+                                               {"id" "sgr-1" "security_group_id" "sg-1"
+                                                "type" "ingress" "protocol" "tcp"
+                                                "from_port" 22 "to_port" 22
+                                                "cidr_blocks" ["0.0.0.0/0"]})]
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-security-group/id "sg-1")]
+      (is (= #{"aws_security_group_rule.discovered-sgr-1"}
+             (child-ids (get (query/new-children-by-parent db) parent))))
+      ;; A further full Sync pass no longer observes the rule (it was
+      ;; removed out-of-band) - `missing-child-tx` marks the Discovered
+      ;; entity's presence false, exactly as it already would for a
+      ;; Terraform-managed one.
+      (d/transact conn {:tx-data (#'sync/missing-child-tx (d/db conn) "aws_security_group_rule" #{})}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-security-group/id "sg-1")]
+      (is (empty? (child-ids (get (query/new-children-by-parent db) parent)))))))
+
+(deftest new-children-by-parent-flags-again-if-the-disappeared-child-reappears
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_iam_role" "lambda_exec" {"name" "lambda-exec"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data]}
+          (sync/resource-tx db0 "aws_iam_role_policy_attachment" nil
+                             {"role" "lambda-exec" "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"})]
+      (d/transact conn {:tx-data tx-data}))
+    (d/transact conn {:tx-data (#'sync/missing-child-tx (d/db conn) "aws_iam_role_policy_attachment" #{})})
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-iam-role/name "lambda-exec")]
+      (is (empty? (child-ids (get (query/new-children-by-parent db) parent)))))
+    (let [db1 (d/db conn)
+          {:keys [tx-data outcome]}
+          (sync/resource-tx db1 "aws_iam_role_policy_attachment" nil
+                             {"role" "lambda-exec" "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"})]
+      (is (= :updated outcome))
+      (d/transact conn {:tx-data tx-data}))
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-iam-role/name "lambda-exec")]
+      (is (= #{(str "aws_iam_role_policy_attachment.discovered-lambda-exec-"
+                    "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")}
+             (child-ids (get (query/new-children-by-parent db) parent)))))))
+
+(deftest removed-children-by-parent-flags-a-missing-managed-security-group-rule
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})
+                                           (resource "aws_security_group_rule" "ssh_open_ingress"
+                                                     {"security_group_id" "sg-1" "from_port" 22 "to_port" 22})]))
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_security_group_rule.ssh_open_ingress"]
+                                  :resource/sync-present? false]]})
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-security-group/id "sg-1")]
+      (is (= #{"aws_security_group_rule.ssh_open_ingress"}
+             (child-ids (get (query/removed-children-by-parent db) parent)))))))
+
+(deftest removed-children-by-parent-does-not-flag-a-present-or-not-yet-checked-child
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})
+                                           (resource "aws_security_group_rule" "ssh_open_ingress"
+                                                     {"security_group_id" "sg-1" "from_port" 22 "to_port" 22})]))
+    (is (empty? (query/removed-children-by-parent (d/db conn))))
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_security_group_rule.ssh_open_ingress"]
+                                  :resource/sync-present? true]]})
+    (is (empty? (query/removed-children-by-parent (d/db conn))))))
+
+(deftest removed-children-by-parent-no-longer-flags-a-reappeared-child
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})
+                                           (resource "aws_security_group_rule" "ssh_open_ingress"
+                                                     {"security_group_id" "sg-1" "from_port" 22 "to_port" 22})]))
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_security_group_rule.ssh_open_ingress"]
+                                  :resource/sync-present? false]]})
+    (is (seq (query/removed-children-by-parent (d/db conn))))
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_security_group_rule.ssh_open_ingress"]
+                                  :resource/sync-present? true]]})
+    (is (empty? (query/removed-children-by-parent (d/db conn))))))
+
+(deftest removed-children-by-parent-flags-a-missing-managed-route
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_route_table" "rt_a" {"id" "rt-1"})
+                                           (resource "aws_route" "rt_a_igw"
+                                                     {"id" "rt-1-0.0.0.0/0" "route_table_id" "rt-1"
+                                                      "destination_cidr_block" "0.0.0.0/0"})]))
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_route.rt_a_igw"] :resource/sync-present? false]]})
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-route-table/id "rt-1")]
+      (is (= #{"aws_route.rt_a_igw"} (child-ids (get (query/removed-children-by-parent db) parent)))))))
+
+(deftest removed-children-by-parent-flags-a-missing-managed-association-under-both-parents
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_route_table" "rt_a" {"id" "rt-1"})
+                                           (resource "aws_subnet" "subnet_a" {"id" "subnet-1" "vpc_id" "vpc-1"})
+                                           (resource "aws_route_table_association" "assoc_a"
+                                                     {"id" "rtbassoc-1" "route_table_id" "rt-1" "subnet_id" "subnet-1"})]))
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_route_table_association.assoc_a"]
+                                  :resource/sync-present? false]]})
+    (let [db      (d/db conn)
+          rt-eid  (eid-by-ident db :aws-route-table/id "rt-1")
+          sn-eid  (eid-by-ident db :aws-subnet/id "subnet-1")
+          result  (query/removed-children-by-parent db)]
+      (is (= #{"aws_route_table_association.assoc_a"} (child-ids (get result rt-eid))))
+      (is (= #{"aws_route_table_association.assoc_a"} (child-ids (get result sn-eid)))))))
+
+(deftest removed-children-by-parent-flags-a-missing-managed-iam-role-policy-attachment
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_iam_role" "lambda_exec" {"name" "lambda-exec"})
+                                           (resource "aws_iam_role_policy_attachment" "lambda_s3"
+                                                     {"role" "lambda-exec"
+                                                      "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"})]))
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_iam_role_policy_attachment.lambda_s3"]
+                                  :resource/sync-present? false]]})
+    (let [db     (d/db conn)
+          parent (eid-by-ident db :aws-iam-role/name "lambda-exec")]
+      (is (= #{"aws_iam_role_policy_attachment.lambda_s3"}
+             (child-ids (get (query/removed-children-by-parent db) parent)))))))
+
+;; ---------------------------------------------------------------------------
+;; GET /drift response shape (issue #32): new_children/removed_children are
+;; present only when a parent actually has one or the other.
+;; ---------------------------------------------------------------------------
+
+;; Uses `aws_iam_role_policy_attachment` - any composite-keyed type would do
+;; equally well here (`new-children-by-parent-flags-a-hand-added-security-
+;; group-rule`/`-flags-a-hand-added-route` above already exercise the
+;; SG-rule/route cases specifically).
+(deftest drift-endpoint-includes-new-children-only-when-present
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_iam_role" "lambda_exec" {"name" "lambda-exec"})]))
+    (let [db0 (d/db conn)
+          {:keys [tx-data]}
+          (sync/resource-tx db0 "aws_iam_role_policy_attachment" nil
+                             {"role" "lambda-exec" "policy_arn" "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"})]
+      (d/transact conn {:tx-data tx-data}))
+    (let [response (query/drift-endpoint conn)
+          body     (json/parse-string (:body response))
+          drifted  (get body "drifted")]
+      (is (= 200 (:status response)))
+      (is (= 1 (count drifted)))
+      (let [entry (first drifted)]
+        (is (= "aws_iam_role.lambda_exec" (get entry "id")))
+        (is (= [{"type" "aws_iam_role_policy_attachment"
+                 "id"   (str "aws_iam_role_policy_attachment.discovered-lambda-exec-"
+                             "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess")}]
+               (get entry "new_children")))
+        (is (not (contains? entry "removed_children")))))))
+
+(deftest drift-endpoint-includes-removed-children-only-when-present
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})
+                                           (resource "aws_security_group_rule" "ssh_open_ingress"
+                                                     {"security_group_id" "sg-1" "from_port" 22 "to_port" 22})]))
+    (d/transact conn {:tx-data [[:db/add [:resource/id "aws_security_group_rule.ssh_open_ingress"]
+                                  :resource/sync-present? false]]})
+    (let [body    (json/parse-string (:body (query/drift-endpoint conn)))
+          entry   (first (get body "drifted"))]
+      (is (= "aws_security_group.ssh_open" (get entry "id")))
+      (is (= [{"type" "aws_security_group_rule" "id" "aws_security_group_rule.ssh_open_ingress"}]
+             (get entry "removed_children")))
+      (is (not (contains? entry "new_children"))))))
+
+(deftest drift-endpoint-attribute-drift-only-entry-keeps-the-existing-flat-shape
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1" "vpc_id" "vpc-a"})]))
+    (let [db (d/db conn)
+          {:keys [tx-data]} (sync/resource-tx db "aws_security_group" "sg-1" {"id" "sg-1" "vpc_id" "vpc-changed"})]
+      (d/transact conn {:tx-data tx-data}))
+    (let [body  (json/parse-string (:body (query/drift-endpoint conn)))
+          entry (first (get body "drifted"))]
+      (is (= {"type" "aws_security_group" "id" "aws_security_group.ssh_open"} entry)))))
+
+(deftest drift-endpoint-with-no-drift-returns-an-empty-list
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body [(resource "aws_security_group" "ssh_open" {"id" "sg-1"})]))
+    (is (= [] (get (json/parse-string (:body (query/drift-endpoint conn))) "drifted")))))
+
 ;; ---------------------------------------------------------------------------
 ;; reachable? - network reachability via graph traversal
 ;; ---------------------------------------------------------------------------
