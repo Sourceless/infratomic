@@ -18,7 +18,7 @@
   (e.g. a destroyed resource), so a resource removed from state never
   lingers in subsequent `GET`s."
   (:require [cheshire.core :as json]
-            [datomic.client.api :as d]
+            [infratomic.state-backend.datomic :as d]
             [infratomic.state-backend.db :as db]))
 
 (defn- managed?

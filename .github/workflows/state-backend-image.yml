@@ -1,0 +1,84 @@
+name: State Backend image
+
+# This repository's first CI workflow (issue #35). Builds the State
+# Backend's container image (state-backend/Dockerfile) and publishes it
+# to GHCR using only the workflow's built-in GITHUB_TOKEN - no
+# my.datomic.com or other external credential is configured or required
+# anywhere in this pipeline (the image depends only on com.datomic/local,
+# never com.datomic/client-pro).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+
+      - name: Run the State Backend's hermetic test suite
+        working-directory: state-backend
+        run: clojure -X:test
+
+      - name: Run the Dev-Local Gateway's hermetic test suite
+        working-directory: dev-local-gateway
+        run: clojure -X:test
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    # Only push on an actual push to `main` or a version tag - never for a
+    # pull request build, which only needs to prove the image still builds
+    # (see the `build-only` job below).
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./state-backend
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  build-only:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./state-backend
+          push: false

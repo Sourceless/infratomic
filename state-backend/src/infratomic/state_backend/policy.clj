@@ -14,10 +14,11 @@
   directly-referenced resource's) Terraform address instead - see
   docs/adr/0004-resolve-plan-time-references-to-address-stand-ins.md."
   (:require [cheshire.core :as json]
+            [clojure.edn :as edn]
             [clojure.string :as str]
-            [datomic.client.api :as d]
+            [infratomic.state-backend.datomic :as d]
             [infratomic.state-backend.db :as db]
-            [infratomic.state-backend.query :as query]))
+            [infratomic.state-backend.validator :as validator]))
 
 ;; ---------------------------------------------------------------------------
 ;; Plan-decomposition glue
@@ -144,35 +145,97 @@
 ;; Rule registry and evaluation
 ;; ---------------------------------------------------------------------------
 
-(def ^:private rules
-  "The static vector of registered Rules: each a map of `:rule/id` (a
-  keyword identifying the Rule in a Violation) and `:rule/query`, a `(fn
-  [db] -> seq-of-maps)` matching `query.clj`'s existing function shape.
-  References `query/security-groups-with-port-22-open` directly - not a
-  copy - so this can never drift out of sync with the live-state version."
-  [{:rule/id    :security-groups-with-port-22-open
-    :rule/query query/security-groups-with-port-22-open}])
+(def ^:private resource-summary-pattern
+  [:resource/id :resource/type])
+
+(defonce ^{:doc "The atom-backed Rule registry (design.md's \"Unified
+  stored Rule format\"), keyed by `:rule/id`. `defonce` (not `def`) so
+  reloading this namespace at a REPL doesn't clobber a Rule registered at
+  runtime via `POST /rules`. Seeded below, at namespace load, with the
+  existing `security-groups-with-port-22-open` Rule."}
+  rule-registry
+  (atom {}))
+
+(def security-groups-with-port-22-open-rule
+  "The stored-data-shape equivalent of `query.clj`'s
+  `security-groups-with-port-22-open` function: the same join (a security
+  group rule's `security_group_id` back to its owning security group's
+  `id`) and the same predicates (`<=`/`>=`, both allowlisted by the shared
+  validator), expressed as a stored Rule map instead of a Clojure function
+  (design.md's \"Unified stored Rule format\" - no `:rule/rule-defs`, this
+  Rule needs no recursive rule set). `:rule/find` binds exactly `?sg`, the
+  security group entity the Rule flags - `evaluate` (not this Rule's own
+  query) pulls it into a `:resource/id`/`:resource/type` pair."
+  {:rule/id    :security-groups-with-port-22-open
+   :rule/find  '[?sg]
+   :rule/in    '[$]
+   :rule/where '[[?sg :aws-security-group/id ?sg-id]
+                 [?rule :aws-security-group-rule/security-group-id ?sg-id]
+                 [?rule :aws-security-group-rule/from-port ?from]
+                 [?rule :aws-security-group-rule/to-port ?to]
+                 [?rule :aws-security-group-rule/cidr-block "0.0.0.0/0"]
+                 [(<= ?from 22)]
+                 [(>= ?to 22)]]})
+
+(swap! rule-registry assoc
+       (:rule/id security-groups-with-port-22-open-rule)
+       security-groups-with-port-22-open-rule)
+
+(defn register-rule!
+  "Validate `rule` (a stored Rule map: `:rule/id`, `:rule/find`,
+  `:rule/in`, `:rule/where`, optional `:rule/rule-defs`) via the shared
+  validator (`validator/validate-query`, which reads `:rule/where` off the
+  map directly) and, on success, `swap!` it into `rule-registry` - upsert
+  by `:rule/id`, replacing any Rule already registered under that id.
+  Returns the validator's `{:valid? true}`/`{:valid? false :reason ...}`
+  result either way; the Rule is registered only when `:valid?` is
+  `true`."
+  [rule]
+  (let [result (validator/validate-query rule (:rule/rule-defs rule))]
+    (when (:valid? result)
+      (swap! rule-registry assoc (:rule/id rule) rule))
+    result))
+
+(defn- rule->query-map
+  [{:rule/keys [find in where]}]
+  (cond-> {:find find :where where}
+    in (assoc :in in)))
+
+(defn- run-rule
+  "Run one stored Rule's query against `db`, returning the seq of values
+  bound to its single `:rule/find` variable - `d/q`'s raw `[[v] [v] ...]`
+  result set flattened to `[v v ...]`. Passes `:rule/rule-defs` as the `%`
+  argument when present, matching `:rule/in`'s `[$ %]` shape."
+  [db {:rule/keys [rule-defs] :as rule}]
+  (let [query (rule->query-map rule)
+        args  (cond-> [db] (seq rule-defs) (conj rule-defs))]
+    (map first (apply d/q query args))))
 
 (defn evaluate
   "Given `conn` and a parsed plan document, builds the plan's speculative
   tx-data and transacts it into a *speculative* db value only - `(d/with
   (d/with-db conn) {:tx-data ...})`, never `d/transact` - runs every
-  registered Rule against the resulting `:db-after`, and returns a seq of
+  registered Rule (read fresh from `rule-registry` on every call - no
+  closed-over snapshot, so a Rule registered at runtime is visible on the
+  very next call) against the resulting `:db-after`, and returns a seq of
   Violation maps (`{:rule <keyword> :resource/id ... :resource/type
-  ...}`), one per resource returned by a Rule. `d/with` is a pure,
-  non-mutating operation on a db value: `conn`'s live db, and any
-  concurrent real `/state` traffic against it, are never affected."
+  ...}`), one per value a Rule's query binds - each bound entity is pulled
+  into its `:resource/id`/`:resource/type` pair here, in this shared
+  evaluation code, not inside the Rule's own query (design.md). `d/with`
+  is a pure, non-mutating operation on a db value: `conn`'s live db, and
+  any concurrent real `/state` traffic against it, are never affected."
   [conn parsed]
   (let [tx-data  (plan->tx-data parsed)
         db-after (:db-after (d/with (d/with-db conn) {:tx-data tx-data}))]
-    (mapcat (fn [{rule-id :rule/id rule-query :rule/query}]
-              (map (fn [{:resource/keys [id type]}]
-                     {:rule rule-id :resource/id id :resource/type type})
-                   (rule-query db-after)))
-            rules)))
+    (mapcat (fn [[rule-id rule]]
+              (map (fn [eid]
+                     (let [{:resource/keys [id type]} (d/pull db-after resource-summary-pattern eid)]
+                       {:rule rule-id :resource/id id :resource/type type}))
+                   (run-rule db-after rule)))
+            @rule-registry)))
 
 ;; ---------------------------------------------------------------------------
-;; HTTP handler
+;; HTTP handlers
 ;; ---------------------------------------------------------------------------
 
 (defn- parse-json
@@ -203,3 +266,33 @@
       {:status  200
        :headers {"Content-Type" "application/json"}
        :body    (json/generate-string {:violations (mapv violation->json (evaluate conn parsed))})})))
+
+(defn- parse-edn
+  "Parse `s` as EDN, returning ::invalid instead of throwing on failure -
+  mirrors `parse-json`'s error handling, for the EDN-bodied `/rules`
+  endpoint."
+  [s]
+  (try
+    (edn/read-string s)
+    (catch Exception _
+      ::invalid)))
+
+(defn register-rule-endpoint
+  "Handle a `POST /rules` request body: parse `raw-body` as EDN (a stored
+  Rule map), validate and register it via `register-rule!`, and respond
+  `200` on success or `400` with the reason on invalid EDN or a validator
+  rejection."
+  [raw-body]
+  (let [parsed (parse-edn raw-body)]
+    (if (or (= parsed ::invalid) (not (map? parsed)))
+      {:status  400
+       :headers {"Content-Type" "application/edn"}
+       :body    (pr-str {:reason "invalid EDN: expected a Rule map"})}
+      (let [result (register-rule! parsed)]
+        (if (:valid? result)
+          {:status  200
+           :headers {"Content-Type" "application/edn"}
+           :body    (pr-str {:registered (:rule/id parsed)})}
+          {:status  400
+           :headers {"Content-Type" "application/edn"}
+           :body    (pr-str result)})))))

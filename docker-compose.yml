@@ -12,5 +12,26 @@ services:
       - "localstack-data:/var/lib/localstack"
       - "/var/run/docker.sock:/var/run/docker.sock"
 
+  # The Dev-Local Gateway (issue #35): a separately-run process wrapping a
+  # real dev-local Datomic database behind an HTTP+EDN wire protocol, so
+  # the State Backend can run in `gateway` mode (`INFRATOMIC_DATOMIC_MODE=
+  # gateway`) against a genuinely network-separated database instead of an
+  # in-process embedded one. Not started by default alongside `localstack`
+  # (the State Backend's default local dev workflow, documented in
+  # README.md/docs/user-guide.md, still runs `embedded` mode directly from
+  # a checkout) - bring it up explicitly (`docker compose up gateway`) to
+  # exercise `gateway` mode locally. See docs/user-guide.md for the full
+  # gateway-mode walkthrough.
+  gateway:
+    build: ./dev-local-gateway
+    container_name: infratomic-dev-local-gateway
+    ports:
+      - "8081:8081"
+    environment:
+      - INFRATOMIC_GATEWAY_PORT=8081
+    volumes:
+      - "gateway-data:/.datomic-gateway"
+
 volumes:
   localstack-data:
+  gateway-data:

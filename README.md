@@ -2,6 +2,11 @@
 
 The logic-powered infrastructure database
 
+See [`docs/user-guide.md`](docs/user-guide.md) for an end-to-end
+operator's walkthrough of every capability below - including running the
+State Backend as a published container against a Dev-Local Gateway and
+LocalStack, rather than from a checkout.
+
 ## Local Datomic database
 
 `deps.edn` and `src/infratomic/datomic.clj` set up a local, file-backed

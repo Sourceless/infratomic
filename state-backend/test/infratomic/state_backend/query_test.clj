@@ -4,6 +4,7 @@
   handler's `POST` path - mirroring `handler_test.clj`'s fixture pattern -
   so query results are checked against realistically-decomposed data."
   (:require [cheshire.core :as json]
+            [clojure.edn :as edn]
             [clojure.test :refer [deftest is testing]]
             [datomic.client.api :as d]
             [infratomic.state-backend.db :as db]
@@ -397,3 +398,59 @@
 (deftest reachable-within-hops?-self
   (let [db (chain-db)]
     (is (query/reachable-within-hops? db "instance-chain-a" "instance-chain-a" 0))))
+
+;; ---------------------------------------------------------------------------
+;; Ad-hoc query HTTP endpoint (POST /query)
+;; ---------------------------------------------------------------------------
+
+(defn- seeded-conn
+  []
+  (let [conn (fresh-conn)]
+    (handler/post-state conn (state-body sample-resources))
+    conn))
+
+(deftest ad-hoc-query-with-only-db-input-runs-and-returns-results
+  (let [conn (seeded-conn)
+        resp (query/ad-hoc-query
+              conn
+              (pr-str '{:find  [?id]
+                        :where [[?e :resource/type "aws_s3_bucket"]
+                                [?e :resource/id ?id]]}))]
+    (is (= 200 (:status resp)))
+    (is (= #{["aws_s3_bucket.uploads"]}
+           (into #{} (edn/read-string (:body resp)))))))
+
+(deftest ad-hoc-query-with-a-disallowed-function-invocation-clause-is-rejected-with-400
+  (let [conn (seeded-conn)
+        resp (query/ad-hoc-query
+              conn
+              (pr-str '{:find  [?id]
+                        :where [[?e :resource/id ?id]
+                                [(str ?id) ?bad]]}))]
+    (is (= 400 (:status resp)))
+    (is (:reason (edn/read-string (:body resp))))))
+
+(deftest ad-hoc-query-with-invalid-edn-is-rejected-with-400
+  (let [conn (seeded-conn)
+        resp (query/ad-hoc-query conn "not { valid edn")]
+    (is (= 400 (:status resp)))))
+
+(deftest ad-hoc-query-with-a-rule-set-is-accepted-and-evaluated
+  (testing "a genuinely self-referential rule set (its recursive case invokes itself) - the
+    ad-hoc query endpoint only ever supplies $ and % as d/q inputs, so both the base and
+    recursive case bind ?dst from a real datom pattern rather than an :in-bound literal"
+    (let [conn (seeded-conn)
+          resp (query/ad-hoc-query
+                conn
+                (pr-str '{:find      [?dst]
+                          :in        [$ %]
+                          :where     [(reachable-ids ?dst)]
+                          :rule-defs [[(reachable-ids ?dst)
+                                       [?e :resource/id ?dst]]
+                                      [(reachable-ids ?dst)
+                                       [?e :resource/id ?dst]
+                                       (reachable-ids ?dst)]]}))]
+      (is (= 200 (:status resp)))
+      (let [result (edn/read-string (:body resp))]
+        (is (= (into #{} (map (fn [r] (str (get r "type") "." (get r "name")))) sample-resources)
+               (into #{} (map first) result)))))))

@@ -210,3 +210,117 @@
                   [(planned-resource "aws_security_group" "https_only" {"id" nil})]
                   [(config-resource "aws_security_group" "https_only")])]
         (is (empty? (policy/evaluate conn plan)))))))
+
+;; ---------------------------------------------------------------------------
+;; Runtime Rule registration (register-rule!, register-rule-endpoint,
+;; POST /rules)
+;; ---------------------------------------------------------------------------
+
+(defn- with-cleanup
+  "Run `f` (a 0-arg thunk registering a Rule under `rule-id`), then remove
+  `rule-id` from `policy/rule-registry` afterward regardless of outcome -
+  the registry is a shared, process-wide `defonce` atom, so tests that
+  register a Rule must not leak it into other tests."
+  [rule-id f]
+  (try
+    (f)
+    (finally
+      (swap! policy/rule-registry dissoc rule-id))))
+
+(deftest register-rule!-adds-a-valid-new-rule-to-the-registry
+  (let [rule-id (keyword (str "test-rule-" (random-uuid)))]
+    (with-cleanup rule-id
+      (fn []
+        (let [rule   {:rule/id    rule-id
+                       :rule/find  '[?e]
+                       :rule/in    '[$]
+                       :rule/where '[[?e :resource/id ?id]]}
+              result (policy/register-rule! rule)]
+          (is (= {:valid? true} result))
+          (is (= rule (get @policy/rule-registry rule-id))))))))
+
+(deftest register-rule!-rejects-a-disallowed-function-invocation-clause-and-does-not-register-it
+  (let [rule-id (keyword (str "test-rule-" (random-uuid)))]
+    (with-cleanup rule-id
+      (fn []
+        (let [rule   {:rule/id    rule-id
+                       :rule/find  '[?e]
+                       :rule/in    '[$]
+                       :rule/where '[[?e :resource/id ?id]
+                                     [(str ?id) ?bad]]}
+              result (policy/register-rule! rule)]
+          (is (false? (:valid? result)))
+          (is (not (contains? @policy/rule-registry rule-id))))))))
+
+(deftest register-rule!-upserts-by-rule-id-replacing-the-previous-rule
+  (let [rule-id (keyword (str "test-rule-" (random-uuid)))]
+    (with-cleanup rule-id
+      (fn []
+        (policy/register-rule! {:rule/id    rule-id
+                                 :rule/find  '[?e]
+                                 :rule/in    '[$]
+                                 :rule/where '[[?e :resource/id ?id]]})
+        (let [replacement {:rule/id    rule-id
+                            :rule/find  '[?e]
+                            :rule/in    '[$]
+                            :rule/where '[[?e :aws-security-group/id ?id]]}]
+          (policy/register-rule! replacement)
+          (is (= replacement (get @policy/rule-registry rule-id))))))))
+
+(deftest a-runtime-registered-rule-is-visible-to-the-very-next-policy-check
+  (let [rule-id (keyword (str "test-rule-" (random-uuid)))]
+    (with-cleanup rule-id
+      (fn []
+        (let [conn (fresh-conn)]
+          (policy/register-rule! {:rule/id    rule-id
+                                   :rule/find  '[?e]
+                                   :rule/in    '[$]
+                                   :rule/where '[[?e :aws-s3-bucket/arn ?arn]]})
+          (let [plan (plan-doc
+                      [(planned-resource "aws_s3_bucket" "uploads" {"arn" "arn:aws:s3:::uploads"})]
+                      [(config-resource "aws_s3_bucket" "uploads")])]
+            (is (= [{:rule rule-id :resource/id "aws_s3_bucket.uploads" :resource/type "aws_s3_bucket"}]
+                   (policy/evaluate conn plan)))))))))
+
+(deftest register-rule!-accepts-a-rule-with-a-recursive-rule-set
+  (let [rule-id (keyword (str "test-rule-" (random-uuid)))]
+    (with-cleanup rule-id
+      (fn []
+        (let [rule   {:rule/id        rule-id
+                       :rule/find      '[?e]
+                       :rule/in        '[$ %]
+                       :rule/where     '[[?e :resource/id ?id]
+                                         (self-linked ?e)]
+                       :rule/rule-defs '[[(self-linked ?e)
+                                          [(> 1 0)]]]}
+              result (policy/register-rule! rule)]
+          (is (= {:valid? true} result)))))))
+
+(deftest register-rule-endpoint-responds-200-and-registers-a-valid-rule
+  (let [rule-id (keyword (str "test-rule-" (random-uuid)))]
+    (with-cleanup rule-id
+      (fn []
+        (let [rule-edn (pr-str {:rule/id    rule-id
+                                 :rule/find  '[?e]
+                                 :rule/in    '[$]
+                                 :rule/where '[[?e :resource/id ?id]]})
+              resp     (policy/register-rule-endpoint rule-edn)]
+          (is (= 200 (:status resp)))
+          (is (contains? @policy/rule-registry rule-id)))))))
+
+(deftest register-rule-endpoint-responds-400-for-a-disallowed-clause
+  (let [rule-id (keyword (str "test-rule-" (random-uuid)))]
+    (with-cleanup rule-id
+      (fn []
+        (let [rule-edn (pr-str {:rule/id    rule-id
+                                 :rule/find  '[?e]
+                                 :rule/in    '[$]
+                                 :rule/where '[[?e :resource/id ?id]
+                                               [(str ?id) ?bad]]})
+              resp     (policy/register-rule-endpoint rule-edn)]
+          (is (= 400 (:status resp)))
+          (is (not (contains? @policy/rule-registry rule-id))))))))
+
+(deftest register-rule-endpoint-responds-400-for-invalid-edn
+  (let [resp (policy/register-rule-endpoint "not { valid edn")]
+    (is (= 400 (:status resp)))))
