@@ -5,8 +5,10 @@
   (`POST /query`) and Policy Check Rule registration (`POST /rules`).
 
   Walks every `:where` clause of a query map - recursing into `not`/
-  `not-join`/`or`/`or-join` sub-clauses, and into every rule body in an
-  accompanying `%` rule-set (`rule-defs`) - and rejects the query if any
+  `not-join`/`or`/`or-join`/`and` sub-clauses (including `and`-grouped
+  clauses nested inside an `or`/`or-join` branch), and into every rule body
+  in an accompanying `%` rule-set (`rule-defs`) - and rejects the query if
+  any
   clause is a function-invocation clause (Datalog's `[(sym args...)
   binding?]` shape: a vector whose first element is a list) whose `sym` is
   not in `allowed-predicates`. A bare-list clause like `(reaches ?src
@@ -43,10 +45,13 @@
       (when-not (contains? allowed-predicates sym)
         {:valid? false :reason (str "disallowed function-invocation clause: " (pr-str sym))}))
 
-    ;; `not`/`or`: `(not clause...)` / `(or clause...)` - a plain list whose
-    ;; first element is the operator symbol, the rest sub-clauses to
-    ;; recurse into.
-    (and (seq? clause) (contains? #{'not 'or} (first clause)))
+    ;; `not`/`or`/`and`: `(not clause...)` / `(or clause...)` /
+    ;; `(and clause...)` - a plain list whose first element is the operator
+    ;; symbol, the rest sub-clauses to recurse into. `and` only appears
+    ;; nested inside `or`/`or-join` per Datomic's :where grammar (grouping
+    ;; multiple clauses into one `or` branch), but is handled generally
+    ;; here regardless of nesting position.
+    (and (seq? clause) (contains? #{'not 'or 'and} (first clause)))
     (validate-where (rest clause))
 
     ;; `not-join`/`or-join`: `(not-join [vars...] clause...)` /

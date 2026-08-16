@@ -80,6 +80,23 @@
                                              [(str ?e) ?x]
                                              [?e :resource/id ?x])]})))))
 
+(deftest validation-recurses-into-and-clauses-nested-inside-or
+  (testing "a disallowed function-invocation clause hidden inside an `and`-grouped branch
+    of an `or` clause is rejected, not silently passed through as an unrecognized bare-list
+    clause"
+    (is (false? (:valid? (validator/validate-query
+                           '{:find  [?e]
+                             :where [(or (and [?e :resource/id ?id]
+                                               [(clojure.core/slurp "/etc/passwd") ?out])
+                                         [?e :other ?v])]})))))
+  (testing "the same nesting is caught inside an `or-join` too"
+    (is (false? (:valid? (validator/validate-query
+                           '{:find  [?e]
+                             :where [(or-join [?e]
+                                               (and [?e :resource/id ?id]
+                                                    [(clojure.core/slurp "/etc/passwd") ?out])
+                                               [?e :other ?v])]}))))))
+
 (deftest validation-recurses-into-every-rule-body-in-rule-defs
   (testing "a disallowed function-invocation clause inside a rule body is rejected, even
     though the query's own :where only invokes the rule by name"
