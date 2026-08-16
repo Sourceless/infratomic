@@ -21,7 +21,7 @@
   docs/adr/0002-reconstruct-state-instead-of-raw-storage.md)."
   (:require [cheshire.core :as json]
             [clojure.string :as str]
-            [datomic.client.api :as d]))
+            [infratomic.state-backend.datomic :as d]))
 
 (def db-name "state-backend")
 
@@ -331,14 +331,46 @@
   []
   (str (System/getProperty "user.dir") "/../.datomic"))
 
+(defn- gateway-base-url
+  "The configured Dev-Local Gateway's base URL, read from
+  `INFRATOMIC_GATEWAY_HOST`/`INFRATOMIC_GATEWAY_PORT` (defaulting to
+  `localhost`/`8081`) - read only when `INFRATOMIC_DATOMIC_MODE=gateway`."
+  []
+  (let [host (or (System/getenv "INFRATOMIC_GATEWAY_HOST") "localhost")
+        port (or (System/getenv "INFRATOMIC_GATEWAY_PORT") "8081")]
+    (str "http://" host ":" port)))
+
+(defn gateway-mode?
+  "Whether `INFRATOMIC_DATOMIC_MODE` selects `gateway` mode. Any other value
+  (including unset) selects `embedded` mode - today's behavior - per the
+  state-backend spec's \"When the variable is unset, the State Backend
+  SHALL behave exactly as it does today\" requirement."
+  []
+  (= "gateway" (System/getenv "INFRATOMIC_DATOMIC_MODE")))
+
 (defn client
-  "Build a Datomic dev-local client backed by `dir` (defaulting to
-  `storage-dir`)."
-  ([] (client (storage-dir)))
+  "Build a Datomic client. With no args, reads `INFRATOMIC_DATOMIC_MODE`:
+  `gateway` connects to the Dev-Local Gateway configured by
+  `gateway-base-url` over the network; anything else (including unset)
+  falls back to the one-arg embedded form below, identical to today's
+  behavior. The one-arg form always builds an embedded dev-local client
+  backed by `dir`, ignoring `INFRATOMIC_DATOMIC_MODE` - used directly by
+  the test suite (`(client :mem)`) so tests stay hermetic and embedded
+  regardless of the environment they run in. The embedded form returns the
+  raw real `datomic.client.api` client value (not the facade's
+  `EmbeddedClient` wrapper - see `infratomic.state-backend.datomic`'s
+  docstring), so it and everything derived from it (conn, db, historical
+  db) is exactly what direct `datomic.client.api` calls (as every test
+  namespace still makes) expect."
+  ([]
+   (if (gateway-mode?)
+     (d/client {:mode :gateway :base-url (gateway-base-url)})
+     (client (storage-dir))))
   ([dir]
-   (d/client {:server-type :datomic-local
-              :system      "infratomic"
-              :storage-dir dir})))
+   (:client (d/client {:mode        :embedded
+                        :server-type :datomic-local
+                        :system      "infratomic"
+                        :storage-dir dir}))))
 
 (defn- untagged-resource-eids
   "Entity ids of every resource entity with no `:resource/managed?` value

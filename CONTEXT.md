@@ -91,3 +91,7 @@ _Avoid_: assume-role policy (as a distinct mechanism), trust relationship
 **IAM-reachable**:
 The result of `iam-reachable?`: whether a Principal can perform a given IAM action on a given resource, per the deployed IAM policy graph — identity-based Policy Statements, resource-based Policy Statements, and role-assumption chains of Trust Policies, with explicit-deny-overrides-allow semantics — evaluated as recursive Datalog (`grants`), not an application-level walk of parsed policy JSON. Distinct from Reachable, which answers network reachability, not IAM access.
 _Avoid_: has access, is authorized, can assume
+
+**Dev-Local Gateway**:
+A new network-separated process that sits in front of the State Backend's existing dev-local-embedded Datomic, exposing a wire protocol shaped to mirror Datomic Pro/Cloud's own `datomic.client.api` semantics (opaque db/connection handles, same conceptual request/response shape) rather than an ad-hoc bespoke RPC design. Satisfies issue #35's "connects to Datomic Pro, not dev-local" intent via genuine network separation instead of a literal Datomic Pro/Peer Server connection — chosen because `com.datomic/client-pro` requires a my.datomic.com-gated Maven repo with no clear build/CI credential path, and no official Datomic Pro Docker image exists. The mirrored protocol shape means a real my.datomic.com/client-pro-backed environment could later replace the Gateway with minimal change to the State Backend side.
+_Avoid_: the proxy, the bridge, Datomic Pro connection

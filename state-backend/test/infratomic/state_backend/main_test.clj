@@ -9,7 +9,8 @@
             [clojure.test :refer [deftest is]]
             [datomic.client.api :as d]
             [infratomic.state-backend.db :as db]
-            [infratomic.state-backend.main :as main]))
+            [infratomic.state-backend.main :as main]
+            [infratomic.state-backend.policy :as policy]))
 
 (defn- fresh-conn
   "A connection to a freshly-created, schema-loaded, in-memory dev-local
@@ -49,3 +50,33 @@
         response (handler {:request-method :get :uri "/drift"})]
     (is (= 200 (:status response)))
     (is (= [] (get (json/parse-string (:body response)) "drifted")))))
+
+(deftest query-with-a-non-post-method-is-405-not-404
+  (let [handler (main/app-handler (fresh-conn) nil)]
+    (is (= 405 (:status (handler {:request-method :get :uri "/query"}))))
+    (is (= 405 (:status (handler {:request-method :delete :uri "/query"}))))))
+
+(deftest query-with-post-runs-the-query-against-the-live-db
+  (let [handler (main/app-handler (fresh-conn) nil)
+        body    (java.io.ByteArrayInputStream.
+                 (.getBytes (pr-str '{:find [?e] :where [[?e :resource/id ?id]]}) "UTF-8"))
+        response (handler {:request-method :post :uri "/query" :body body})]
+    (is (= 200 (:status response)))))
+
+(deftest rules-with-a-non-post-method-is-405-not-404
+  (let [handler (main/app-handler (fresh-conn) nil)]
+    (is (= 405 (:status (handler {:request-method :get :uri "/rules"}))))
+    (is (= 405 (:status (handler {:request-method :delete :uri "/rules"}))))))
+
+(deftest rules-with-post-registers-a-rule
+  (let [handler (main/app-handler (fresh-conn) nil)
+        rule-id (keyword (str "main-test-rule-" (random-uuid)))
+        body    (java.io.ByteArrayInputStream.
+                 (.getBytes (pr-str {:rule/id rule-id :rule/find '[?e] :rule/in '[$]
+                                      :rule/where '[[?e :resource/id ?id]]})
+                            "UTF-8"))]
+    (try
+      (let [response (handler {:request-method :post :uri "/rules" :body body})]
+        (is (= 200 (:status response))))
+      (finally
+        (swap! policy/rule-registry dissoc rule-id)))))

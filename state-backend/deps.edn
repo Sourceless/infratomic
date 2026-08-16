@@ -9,6 +9,11 @@
         com.cognitect.aws/ec2 {:mvn/version "848.2.1413.0"}
         com.cognitect.aws/iam {:mvn/version "848.2.1413.0"}}
  :aliases {:test {:extra-paths ["test"]
+                   :extra-deps {infratomic/dev-local-gateway {:local/root "../dev-local-gateway"}}
                    :exec-fn    infratomic.state-backend.test-runner/run-tests}
            :integration-test {:extra-paths ["test"]
-                               :exec-fn    infratomic.state-backend.test-runner/run-integration-tests}}}
+                               :extra-deps {infratomic/dev-local-gateway {:local/root "../dev-local-gateway"}}
+                               :exec-fn    infratomic.state-backend.test-runner/run-integration-tests}
+           :build {:deps      {io.github.clojure/tools.build
+                                {:git/tag "v0.10.5" :git/sha "2a21b7a"}}
+                   :ns-default build}}}

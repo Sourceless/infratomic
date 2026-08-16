@@ -47,7 +47,7 @@
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as credentials]
             [cognitect.aws.http :as aws-http]
-            [datomic.client.api :as d]
+            [infratomic.state-backend.datomic :as d]
             [infratomic.state-backend.db :as db])
   (:import [java.net URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]

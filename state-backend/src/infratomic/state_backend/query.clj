@@ -8,8 +8,10 @@
   in-memory db in tests - no HTTP layer involved, functions only, called
   from tests, per the issue's scope."
   (:require [cheshire.core :as json]
-            [datomic.client.api :as d]
-            [infratomic.state-backend.db :as db]))
+            [clojure.edn :as edn]
+            [infratomic.state-backend.datomic :as d]
+            [infratomic.state-backend.db :as db]
+            [infratomic.state-backend.validator :as validator]))
 
 (def ^:private resource-summary-pattern
   [:resource/id :resource/type])
@@ -671,3 +673,45 @@
                :in $ % ?src ?dst ?max-hops
                :where (chain-reaches ?src ?dst ?max-hops)]
              db chain-rules src dst max-hops))))
+
+;; ---------------------------------------------------------------------------
+;; Ad-hoc query HTTP endpoint
+;; ---------------------------------------------------------------------------
+
+(defn- parse-edn
+  "Parse `s` as EDN, returning ::invalid instead of throwing on failure -
+  mirrors `handler.clj`'s own JSON-parsing error handling, for the
+  EDN-bodied `/query` endpoint."
+  [s]
+  (try
+    (edn/read-string s)
+    (catch Exception _
+      ::invalid)))
+
+(defn ad-hoc-query
+  "Handle a `POST /query` request body: parse `raw-body` as EDN (a
+  `{:find ... :in ... :where ...}` query map, optionally with a
+  `:rule-defs` rule-set alongside `%` in `:in`), validate it via the
+  shared validator, and on success run it against `(d/db conn)`,
+  responding `200` with the raw `d/q` result set, EDN-encoded (no
+  result-shape assumption, unlike a Rule - any `:find` shape that passes
+  validation is run as-is). Responds `400` with the reason on invalid EDN
+  or a validator rejection, without running the query."
+  [conn raw-body]
+  (let [parsed (parse-edn raw-body)]
+    (if (or (= parsed ::invalid) (not (map? parsed)))
+      {:status  400
+       :headers {"Content-Type" "application/edn"}
+       :body    (pr-str {:reason "invalid EDN: expected a query map"})}
+      (let [rule-defs  (:rule-defs parsed)
+            validation (validator/validate-query parsed rule-defs)]
+        (if-not (:valid? validation)
+          {:status  400
+           :headers {"Content-Type" "application/edn"}
+           :body    (pr-str validation)}
+          (let [query  (select-keys parsed [:find :in :where])
+                args   (cond-> [(d/db conn)] (seq rule-defs) (conj rule-defs))
+                result (apply d/q query args)]
+            {:status  200
+             :headers {"Content-Type" "application/edn"}
+             :body    (pr-str result)}))))))
