@@ -320,7 +320,38 @@
     {:db/ident       :iam-statement/kind
      :db/valueType   :db.type/keyword
      :db/cardinality :db.cardinality/one
-     :db/doc         "`:identity`, `:resource`, or `:trust` - which side of an access grant this statement evaluates, so the `grants` rule can distinguish them without re-parsing. Scratch-only, see this schema section's preamble."}]
+     :db/doc         "`:identity`, `:resource`, or `:trust` - which side of an access grant this statement evaluates, so the `grants` rule can distinguish them without re-parsing. Scratch-only, see this schema section's preamble."}
+
+    ;; Unattended terraform execution (issue #33): every apply!/import!/
+    ;; destroy! invocation is recorded unconditionally as an Invocation
+    ;; entity, and guarded by a per-resource-address Lock entity - see
+    ;; infratomic.state-backend.terraform.
+    {:db/ident       :invocation/command
+     :db/valueType   :db.type/keyword
+     :db/cardinality :db.cardinality/one
+     :db/doc         "Which Terraform operation this invocation ran: :apply, :import, or :destroy."}
+    {:db/ident       :invocation/resource-address
+     :db/valueType   :db.type/string
+     :db/cardinality :db.cardinality/one
+     :db/doc         "The resource address this invocation targeted - the same address used for locking (see :lock/resource-address). For :apply, this is the address the caller is invoking apply on behalf of, not necessarily a `-target` passed to `terraform` itself (terraform.clj's `apply!` runs a plain, untargeted `terraform apply`)."}
+    {:db/ident       :invocation/success?
+     :db/valueType   :db.type/boolean
+     :db/cardinality :db.cardinality/one
+     :db/doc         "Whether the underlying `terraform` process exited zero."}
+    {:db/ident       :invocation/at
+     :db/valueType   :db.type/instant
+     :db/cardinality :db.cardinality/one
+     :db/doc         "When this invocation ran. Deliberately the only timestamp kept - captured stdout/stderr is returned to the immediate caller but never persisted here (Datomic dev-local's 4096-byte-per-string limit, see this namespace's docstring)."}
+
+    {:db/ident       :lock/resource-address
+     :db/valueType   :db.type/string
+     :db/cardinality :db.cardinality/one
+     :db/unique      :db.unique/identity
+     :db/doc         "The resource address a per-address invocation lock (infratomic.state-backend.terraform) is currently held for. The entity is created (via an idempotent, concurrency-safe upsert) the first time a lock for this address is attempted and retracted entirely on release - its mere existence with a :lock/acquired-at value means held, its absence (or presence without :lock/acquired-at while a concurrent acquire is mid-flight) means free. See docs/adr/0011-datomic-cas-plus-ttl-lock-for-unattended-terraform-invocations.md for why acquisition is a two-transaction (ensure-entity, then `:db/cas`) sequence rather than a single same-transaction upsert+CAS: `:db/cas` does not reliably interact with tempid upsert resolution within one transaction."}
+    {:db/ident       :lock/acquired-at
+     :db/valueType   :db.type/instant
+     :db/cardinality :db.cardinality/one
+     :db/doc         "When the currently-held lock for this address was acquired - used to compute staleness. Absent (entity exists but this attribute doesn't, immediately after `ensure-lock-entity!` and before the acquiring `:db/cas` transacts) means the lock is currently free."}]
    modeled-schema))
 
 (defn storage-dir

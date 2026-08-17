@@ -11,8 +11,14 @@
  :aliases {:test {:extra-paths ["test"]
                    :extra-deps {infratomic/dev-local-gateway {:local/root "../dev-local-gateway"}}
                    :exec-fn    infratomic.state-backend.test-runner/run-tests}
+           ;; com.cognitect.aws/s3 is an :integration-test-only extra-dep
+           ;; (not top-level :deps): only terraform_integration_test.clj
+           ;; talks to S3 directly (to assert on LocalStack's own bucket
+           ;; state around destroy!/import!) - production code never calls
+           ;; the S3 API, so this stays out of the shipped uberjar.
            :integration-test {:extra-paths ["test"]
-                               :extra-deps {infratomic/dev-local-gateway {:local/root "../dev-local-gateway"}}
+                               :extra-deps {infratomic/dev-local-gateway {:local/root "../dev-local-gateway"}
+                                            com.cognitect.aws/s3        {:mvn/version "848.2.1413.0"}}
                                :exec-fn    infratomic.state-backend.test-runner/run-integration-tests}
            :build {:deps      {io.github.clojure/tools.build
                                 {:git/tag "v0.10.5" :git/sha "2a21b7a"}}
