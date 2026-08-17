@@ -131,6 +131,22 @@
                 ;; something broken.
                 (is (not= 1 exit))))))))))
 
+(deftest import-bang-against-an-address-with-no-config-block-fails-without-side-effects
+  (with-state-backend-server
+    (fn [conn]
+      (with-clean-terraform-state
+        (fn []
+          (terraform! "apply" "-auto-approve")
+          (let [before (slurp (io/file terraform-dir "s3.tf"))
+                result (terraform/import! conn terraform-dir "aws_s3_bucket.nonexistent_in_config" "some-id")]
+            (testing "import! reports failure rather than succeeding or silently no-op'ing"
+              (is (false? (:success result))))
+            (testing "no Terraform configuration was written to create the missing block"
+              (is (= before (slurp (io/file terraform-dir "s3.tf")))))
+            (testing "the already-imported uploads bucket is untouched"
+              (let [show (terraform! "show")]
+                (is (re-find #"aws_s3_bucket\.uploads" show))))))))))
+
 (deftest destroy-bang-with-a-target-address-only-removes-that-resource
   (with-state-backend-server
     (fn [conn]
