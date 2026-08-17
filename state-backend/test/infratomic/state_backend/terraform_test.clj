@@ -226,13 +226,114 @@
     (is (= 400 (:status response)))))
 
 (deftest apply-endpoint-with-valid-fields-runs-and-responds-200-even-on-terraform-failure
-  ;; Hermetic: a nonexistent working directory guarantees run-terraform!
-  ;; reports {:success false ...} (see above), but the *endpoint* itself
-  ;; still confirms-clean-request-shape -> 200, mirroring policy-check's
-  ;; "200 regardless of :success" convention.
+  ;; Hermetic: a nonexistent working directory (but one that still
+  ;; resolves inside terraform-base-dir, so it clears the working_directory
+  ;; validation below) guarantees run-terraform! reports {:success false
+  ;; ...} (see above), but the *endpoint* itself still
+  ;; confirms-clean-request-shape -> 200, mirroring policy-check's "200
+  ;; regardless of :success" convention.
   (let [conn     (fresh-conn)
         response (terraform/apply-endpoint conn (json/generate-string
-                                                   {"working_directory" "/definitely/does/not/exist-4f9a2b"
+                                                   {"working_directory" (str (terraform/terraform-base-dir) "/does-not-exist-4f9a2b")
                                                     "resource_address"  "aws_s3_bucket.uploads"}))]
     (is (= 200 (:status response)))
     (is (false? (get (json/parse-string (:body response)) "success")))))
+
+;; ---------------------------------------------------------------------------
+;; HTTP endpoint request validation: working_directory allowlisting and
+;; resource_address/aws_id argv-flag rejection (issue #33 code review,
+;; findings #1/#2)
+;; ---------------------------------------------------------------------------
+
+(deftest within-base-dir-accepts-the-base-dir-itself-and-a-subdirectory
+  (let [base   (str (System/getProperty "java.io.tmpdir") "/terraform-base-" (random-uuid))
+        nested (str base "/app")]
+    (.mkdirs (java.io.File. ^String nested))
+    (is (true? (#'terraform/within-base-dir? base base)))
+    (is (true? (#'terraform/within-base-dir? base nested)))))
+
+(deftest within-base-dir-rejects-an-unrelated-directory
+  (let [base (str (System/getProperty "java.io.tmpdir") "/terraform-base-" (random-uuid))]
+    (.mkdirs (java.io.File. ^String base))
+    (is (false? (#'terraform/within-base-dir? base "/tmp")))))
+
+(deftest within-base-dir-rejects-a-directory-that-only-shares-a-string-prefix
+  ;; "/tmp/terraform-base-evil" starts with the string "/tmp/terraform-base"
+  ;; but is a sibling, not a descendant - a raw string-prefix check would
+  ;; wrongly accept it.
+  (let [base    (str (System/getProperty "java.io.tmpdir") "/terraform-base")
+        sibling (str base "-evil")]
+    (.mkdirs (java.io.File. ^String base))
+    (.mkdirs (java.io.File. ^String sibling))
+    (is (false? (#'terraform/within-base-dir? base sibling)))))
+
+(deftest within-base-dir-rejects-traversal-back-out-of-the-base-dir
+  (let [base     (str (System/getProperty "java.io.tmpdir") "/terraform-base-" (random-uuid))
+        escaping (str base "/../../etc")]
+    (.mkdirs (java.io.File. ^String base))
+    (is (false? (#'terraform/within-base-dir? base escaping)))))
+
+(deftest safe-argv-token-rejects-a-leading-dash
+  (is (false? (#'terraform/safe-argv-token? "-target=aws_s3_bucket.uploads")))
+  (is (false? (#'terraform/safe-argv-token? "--evil-flag")))
+  (is (true? (#'terraform/safe-argv-token? "aws_s3_bucket.uploads"))))
+
+(deftest apply-endpoint-rejects-a-working-directory-outside-the-base-dir
+  (let [conn     (fresh-conn)
+        response (with-redefs [terraform/terraform-base-dir (constantly "/some/allowed/terraform/base")]
+                   (terraform/apply-endpoint conn (json/generate-string
+                                                     {"working_directory" "/tmp"
+                                                      "resource_address"  "aws_s3_bucket.uploads"})))]
+    (is (= 400 (:status response)))))
+
+(deftest apply-endpoint-rejects-a-working-directory-that-escapes-the-base-dir-via-traversal
+  (let [conn     (fresh-conn)
+        base     (str (System/getProperty "java.io.tmpdir") "/terraform-base-" (random-uuid))
+        escaping (str base "/../etc")]
+    (.mkdirs (java.io.File. ^String base))
+    (let [response (with-redefs [terraform/terraform-base-dir (constantly base)]
+                     (terraform/apply-endpoint conn (json/generate-string
+                                                       {"working_directory" escaping
+                                                        "resource_address"  "aws_s3_bucket.uploads"})))]
+      (is (= 400 (:status response))))))
+
+(deftest apply-endpoint-accepts-a-working-directory-inside-the-base-dir
+  (let [conn   (fresh-conn)
+        base   (str (System/getProperty "java.io.tmpdir") "/terraform-base-" (random-uuid))
+        nested (str base "/app")]
+    (.mkdirs (java.io.File. ^String nested))
+    (let [response (with-redefs [terraform/terraform-base-dir (constantly base)]
+                     (terraform/apply-endpoint conn (json/generate-string
+                                                       {"working_directory" nested
+                                                        "resource_address"  "aws_s3_bucket.uploads"})))]
+      (is (= 200 (:status response))))))
+
+(deftest apply-endpoint-rejects-a-resource-address-starting-with-a-dash
+  (let [conn     (fresh-conn)
+        response (terraform/apply-endpoint conn (json/generate-string
+                                                    {"working_directory" (terraform/terraform-base-dir)
+                                                     "resource_address"  "-target=aws_s3_bucket.uploads"}))]
+    (is (= 400 (:status response)))))
+
+(deftest destroy-endpoint-rejects-a-resource-address-starting-with-a-dash
+  (let [conn     (fresh-conn)
+        response (terraform/destroy-endpoint conn (json/generate-string
+                                                      {"working_directory" (terraform/terraform-base-dir)
+                                                       "resource_address"  "-x"}))]
+    (is (= 400 (:status response)))))
+
+(deftest import-endpoint-rejects-a-resource-address-starting-with-a-dash
+  (let [conn     (fresh-conn)
+        response (terraform/import-endpoint conn (json/generate-string
+                                                     {"working_directory" (terraform/terraform-base-dir)
+                                                      "resource_address"  "-target=aws_s3_bucket.uploads"
+                                                      "aws_id"            "i-0123456789"}))]
+    (is (= 400 (:status response)))))
+
+(deftest import-endpoint-rejects-an-aws-id-starting-with-a-dash
+  (let [conn     (fresh-conn)
+        response (terraform/import-endpoint conn (json/generate-string
+                                                     {"working_directory" (terraform/terraform-base-dir)
+                                                      "resource_address"  "aws_s3_bucket.uploads"
+                                                      "aws_id"            "--evil-flag"}))]
+    (is (= 400 (:status response)))))

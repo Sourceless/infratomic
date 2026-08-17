@@ -28,6 +28,7 @@
   commands)."
   (:require [cheshire.core :as json]
             [clojure.java.shell :as shell]
+            [clojure.string :as str]
             [infratomic.state-backend.datomic :as d]))
 
 ;; ---------------------------------------------------------------------------
@@ -240,6 +241,71 @@
     #(run-terraform! working-dir ["destroy" "-auto-approve" (str "-target=" address)])))
 
 ;; ---------------------------------------------------------------------------
+;; HTTP request validation (issue #33 code review, finding #1/#2): the HTTP
+;; endpoints below are unauthenticated, so `working_directory` cannot be
+;; trusted to name an arbitrary path the OS user can read/write - unlike
+;; `apply!`/`import!`/`destroy!` themselves (still generically parameterized
+;; by working directory, per the terraform-execution spec's "caller-supplied
+;; working directory (not a fixed, hardcoded path)" requirement - this
+;; restriction is an HTTP-layer allowlist, not a change to that primitive),
+;; a request naming a path outside the configured base directory - or using
+;; `..` to escape it - is rejected before `apply!`/`import!`/`destroy!` ever
+;; runs. `resource_address`/`aws_id` are also rejected if they could be
+;; parsed by `terraform` as a flag rather than a positional argument.
+;; ---------------------------------------------------------------------------
+
+(defn terraform-base-dir
+  "The single directory `working_directory` must resolve inside of (itself
+  or any subdirectory), read from `INFRATOMIC_TERRAFORM_BASE_DIR` (following
+  `db.clj`'s `INFRATOMIC_GATEWAY_HOST`/`INFRATOMIC_GATEWAY_PORT` naming
+  convention) - defaulting, when unset, to `../terraform` relative to the
+  process's working directory, matching where the sample Terraform app
+  already lives (`terraform_integration_test.clj`'s own `terraform-dir`) and
+  where `state-backend/` is documented (`db.clj`'s `storage-dir`) to be
+  started from."
+  []
+  (or (System/getenv "INFRATOMIC_TERRAFORM_BASE_DIR")
+      (str (System/getProperty "user.dir") "/../terraform")))
+
+(defn- within-base-dir?
+  "Whether canonicalizing `working-dir` (resolving any `..`/symlinks)
+  lands it at, or inside, `base-dir`'s own canonical form - the actual
+  check, rather than a raw string prefix comparison, so `../terraform-evil`
+  (shares the string prefix `../terraform` but is a sibling, not a
+  descendant) and `working_directory` values containing `..` segments that
+  walk back out of `base-dir` are both correctly rejected. Returns `false`
+  (rather than throwing) if either path can't be resolved at all."
+  [base-dir working-dir]
+  (try
+    (let [base-canonical (.getCanonicalFile (java.io.File. ^String base-dir))
+          dir-canonical  (.getCanonicalFile (java.io.File. ^String working-dir))
+          base-path      (.getCanonicalPath base-canonical)
+          dir-path       (.getCanonicalPath dir-canonical)]
+      (or (= base-path dir-path)
+          (.startsWith dir-path (str base-path java.io.File/separator))))
+    (catch Exception _
+      false)))
+
+(defn- safe-working-dir?
+  [working-dir]
+  (within-base-dir? (terraform-base-dir) working-dir))
+
+(defn- safe-argv-token?
+  "Whether `s` is safe to pass as a positional `terraform` argument
+  (`resource_address`, or `import!`'s `aws_id`) - specifically, that it
+  can't be parsed by `terraform` itself as a flag instead. `sh` execs
+  `terraform` directly with no shell interpolation, so this is not a
+  shell-injection concern - only an argv-parsing one."
+  [s]
+  (not (str/starts-with? s "-")))
+
+(defn- invalid-request-response
+  [message]
+  {:status  400
+   :headers {"Content-Type" "application/json"}
+   :body    (json/generate-string {:error message})})
+
+;; ---------------------------------------------------------------------------
 ;; HTTP handlers (mirrors policy.clj/sync.clj's convention of embedding the
 ;; endpoint's own request-parsing alongside the capability it wraps)
 ;; ---------------------------------------------------------------------------
@@ -286,41 +352,71 @@
   [m fields]
   (seq (remove #(some-> (get m %) str seq) fields)))
 
+(defn- request-validation-error
+  "`nil` if `parsed`'s `working_directory` resolves inside
+  `terraform-base-dir` and every one of `argv-fields` (`resource_address`,
+  and, for `import`, `aws_id`) is safe to pass as a positional `terraform`
+  argument, else a human-readable error message describing the first
+  problem found - used by each endpoint below, after `require-fields`
+  confirms the fields are all present, to reject a request before it ever
+  reaches `apply!`/`import!`/`destroy!` (see this section's own docstring
+  for why: both checks defend the unauthenticated HTTP surface, not the
+  `apply!`/`import!`/`destroy!` primitives themselves)."
+  [parsed argv-fields]
+  (cond
+    (not (safe-working-dir? (get parsed "working_directory")))
+    (str "working_directory must resolve inside the configured Terraform base directory (" (terraform-base-dir) ")")
+
+    (not-every? #(safe-argv-token? (get parsed %)) argv-fields)
+    (str "field(s) must not start with '-': " (pr-str argv-fields))
+
+    :else nil))
+
 (defn apply-endpoint
   "Handle a `POST /apply` request body: `{\"working_directory\": \"...\"
-  \"resource_address\": \"...\"}`. Responds `400` on invalid JSON or a
-  missing required field, else runs `apply!` and responds `200` with its
-  result."
+  \"resource_address\": \"...\"}`. Responds `400` on invalid JSON, a
+  missing required field, a `working_directory` outside the configured
+  base directory, or a `resource_address` unsafe to pass to `terraform`;
+  else runs `apply!` and responds `200` with its result."
   [conn raw-body]
   (let [parsed  (parse-json raw-body)
-        missing (when-not (= parsed ::invalid) (require-fields parsed ["working_directory" "resource_address"]))]
+        missing (when-not (= parsed ::invalid) (require-fields parsed ["working_directory" "resource_address"]))
+        invalid (when-not (or (= parsed ::invalid) missing) (request-validation-error parsed ["resource_address"]))]
     (cond
       (= parsed ::invalid)  (invalid-json-response)
       missing               (missing-fields-response missing)
+      invalid               (invalid-request-response invalid)
       :else                 (result->response (apply! conn (get parsed "working_directory") (get parsed "resource_address"))))))
 
 (defn import-endpoint
   "Handle a `POST /import` request body: `{\"working_directory\": \"...\"
   \"resource_address\": \"...\" \"aws_id\": \"...\"}`. Responds `400` on
-  invalid JSON or a missing required field, else runs `import!` and
-  responds `200` with its result."
+  invalid JSON, a missing required field, a `working_directory` outside
+  the configured base directory, or a `resource_address`/`aws_id` unsafe
+  to pass to `terraform`; else runs `import!` and responds `200` with its
+  result."
   [conn raw-body]
   (let [parsed  (parse-json raw-body)
-        missing (when-not (= parsed ::invalid) (require-fields parsed ["working_directory" "resource_address" "aws_id"]))]
+        missing (when-not (= parsed ::invalid) (require-fields parsed ["working_directory" "resource_address" "aws_id"]))
+        invalid (when-not (or (= parsed ::invalid) missing) (request-validation-error parsed ["resource_address" "aws_id"]))]
     (cond
       (= parsed ::invalid)  (invalid-json-response)
       missing               (missing-fields-response missing)
+      invalid               (invalid-request-response invalid)
       :else                 (result->response (import! conn (get parsed "working_directory") (get parsed "resource_address") (get parsed "aws_id"))))))
 
 (defn destroy-endpoint
   "Handle a `POST /destroy` request body: `{\"working_directory\": \"...\"
-  \"resource_address\": \"...\"}`. Responds `400` on invalid JSON or a
-  missing required field, else runs `destroy!` and responds `200` with
-  its result."
+  \"resource_address\": \"...\"}`. Responds `400` on invalid JSON, a
+  missing required field, a `working_directory` outside the configured
+  base directory, or a `resource_address` unsafe to pass to `terraform`;
+  else runs `destroy!` and responds `200` with its result."
   [conn raw-body]
   (let [parsed  (parse-json raw-body)
-        missing (when-not (= parsed ::invalid) (require-fields parsed ["working_directory" "resource_address"]))]
+        missing (when-not (= parsed ::invalid) (require-fields parsed ["working_directory" "resource_address"]))
+        invalid (when-not (or (= parsed ::invalid) missing) (request-validation-error parsed ["resource_address"]))]
     (cond
       (= parsed ::invalid)  (invalid-json-response)
       missing               (missing-fields-response missing)
+      invalid               (invalid-request-response invalid)
       :else                 (result->response (destroy! conn (get parsed "working_directory") (get parsed "resource_address"))))))
