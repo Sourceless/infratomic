@@ -825,3 +825,33 @@
         {:keys [tx-data outcome]} (sync/resource-tx db "aws_security_group" "sg-managed" {"id" "sg-managed"})]
     (is (= :skipped-already-managed outcome))
     (is (empty? tx-data))))
+
+;; ---------------------------------------------------------------------------
+;; Automatic Sync scheduler (issue #31): `schedule!`/`wrap-failure-isolated`,
+;; against a real `ScheduledExecutorService` and a short real interval
+;; (design.md's "Test strategy" decision - no injectable clock). Every test
+;; here shuts its executor down in a `finally` so a failing assertion never
+;; leaves a background thread running past the test.
+;; ---------------------------------------------------------------------------
+
+(deftest schedule-fires-the-task-multiple-times-on-a-short-interval
+  (let [invocations (atom 0)
+        executor    (sync/schedule! 0.02 (fn [] (swap! invocations inc)))]
+    (try
+      (Thread/sleep 150)
+      (is (>= @invocations 3))
+      (finally
+        (.shutdownNow executor)))))
+
+(deftest schedule-retries-after-the-task-throws-on-its-first-invocation
+  (let [invocations (atom 0)
+        task        (fn []
+                      (swap! invocations inc)
+                      (when (= 1 @invocations)
+                        (throw (ex-info "boom" {}))))
+        executor    (sync/schedule! 0.02 (sync/wrap-failure-isolated task))]
+    (try
+      (Thread/sleep 150)
+      (is (>= @invocations 2) "the task must still fire again after throwing once")
+      (finally
+        (.shutdownNow executor)))))

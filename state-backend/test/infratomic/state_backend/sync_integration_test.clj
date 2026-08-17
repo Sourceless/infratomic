@@ -638,6 +638,52 @@
               (finally
                 (aws/stop ec2-client)))))))))
 
+;; ---------------------------------------------------------------------------
+;; Automatic (scheduled) Sync (issue #31): a resource hand-created directly
+;; against LocalStack, with no `POST /sync`/CLI trigger ever invoked, still
+;; appears as a Discovered Resource once the scheduler's configured interval
+;; elapses - exercising the real `sync/schedule!`/`wrap-failure-isolated`
+;; wiring against a real db/EC2 client, mirroring how `main.clj`'s `-main`
+;; wires them together (short real interval, not the `INFRATOMIC_SYNC_INTERVAL_SECONDS`
+;; default, per design.md's "no injectable clock" test strategy). Polls for
+;; the discovered entity up to a generous bound rather than a single fixed
+;; sleep - a real `sync!` pass's duration scales with however many resources
+;; already exist in the shared LocalStack instance this suite runs against,
+;; so a fixed short sleep would be flaky independent of anything this test
+;; itself is asserting.
+;; ---------------------------------------------------------------------------
+
+(defn- wait-for-eid
+  "Polls `(eid-by-aws-id (d/db conn) ident aws-id)` every 200ms until it
+  returns non-nil or `timeout-ms` elapses, returning whatever the last poll
+  returned - used instead of a single fixed sleep so this test's pass/fail
+  doesn't depend on how long a real `sync!` pass happens to take against
+  however many resources the shared LocalStack instance already holds."
+  [conn ident aws-id timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [eid (eid-by-aws-id (d/db conn) ident aws-id)]
+        (cond
+          (some? eid) eid
+          (>= (System/currentTimeMillis) deadline) nil
+          :else (do (Thread/sleep 200) (recur)))))))
+
+(deftest scheduled-sync-discovers-an-out-of-band-resource-without-an-explicit-trigger
+  (with-state-backend-server
+    (fn [conn]
+      (let [client   (sync/ec2-client)
+            sg-id    (create-out-of-band-security-group! client)
+            executor (sync/schedule! 0.05 (sync/wrap-failure-isolated (fn [] (sync/sync! conn client))))]
+        (try
+          (testing "the out-of-band security group is discovered automatically, without POST /sync or a CLI sync"
+            (let [eid (wait-for-eid conn :aws-security-group/id sg-id 60000)]
+              (is (some? eid))
+              (is (= false (:resource/managed? (d/pull (d/db conn) [:resource/managed?] eid))))))
+          (finally
+            (.shutdownNow executor)
+            (aws/invoke client {:op :DeleteSecurityGroup :request {:GroupId sg-id}})
+            (aws/stop client)))))))
+
 (deftest post-sync-endpoint-returns-a-summary-reflecting-real-localstack-resources
   (with-state-backend-server
     (fn [conn]

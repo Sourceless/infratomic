@@ -11,6 +11,14 @@
 
 (def port 8080)
 
+(defn- sync-interval-seconds
+  "`INFRATOMIC_SYNC_INTERVAL_SECONDS` (seconds, default `300`) - how often
+  the scheduler (`sync/schedule!`) automatically triggers Sync in the
+  normal-startup path, read once at startup, following the existing
+  `INFRATOMIC_<NAME>` convention (`db.clj`'s `gateway-mode?`/`gateway-url`)."
+  []
+  (Long/parseLong (or (System/getenv "INFRATOMIC_SYNC_INTERVAL_SECONDS") "300")))
+
 (defn app-handler
   "The full Ring handler: `handler.clj`'s own `/state` dispatch (untouched),
   plus the `POST /policy-check` (`policy.clj`), `POST /sync` (`sync.clj`),
@@ -63,12 +71,15 @@
 
 (defn -main
   "With no args, the normal startup path: connect (implicitly bootstrapping
-  schema via `db/ensure-db!`, as always) and start Jetty. With `bootstrap`
-  as the sole arg, run the same `db/ensure-db!` call and exit `0` without
-  starting Jetty - useful for scripted/CI setup against a fresh database
-  (e.g. a Dev-Local Gateway db in `gateway` mode) before the server itself
-  needs to be up. Both paths call the exact same `db/ensure-db!` - there is
-  only ever one bootstrap implementation."
+  schema via `db/ensure-db!`, as always), start the automatic Sync
+  scheduler (`sync/schedule!`, issue #31 - runs `sync/sync!` on a fixed
+  `INFRATOMIC_SYNC_INTERVAL_SECONDS`-configured delay, in addition to the
+  existing on-demand `POST /sync` trigger), and start Jetty. With
+  `bootstrap` as the sole arg, run the same `db/ensure-db!` call and exit
+  `0` without starting Jetty or the scheduler - useful for scripted/CI
+  setup against a fresh database (e.g. a Dev-Local Gateway db in `gateway`
+  mode) before the server itself needs to be up. Both paths call the exact
+  same `db/ensure-db!` - there is only ever one bootstrap implementation."
   [& args]
   (if (= "bootstrap" (first args))
     (do
@@ -78,4 +89,6 @@
     (let [conn (db/ensure-db! (db/client))
           ec2-client (sync/ec2-client)]
       (println (str "State Backend listening on port " port))
+      (sync/schedule! (sync-interval-seconds)
+                       (sync/wrap-failure-isolated (fn [] (sync/sync! conn ec2-client))))
       (jetty/run-jetty (app-handler conn ec2-client) {:port port :join? true}))))
