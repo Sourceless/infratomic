@@ -6,6 +6,7 @@
             [infratomic.state-backend.policy :as policy]
             [infratomic.state-backend.query :as query]
             [infratomic.state-backend.sync :as sync]
+            [infratomic.state-backend.terraform :as terraform]
             [ring.adapter.jetty :as jetty])
   (:gen-class))
 
@@ -23,15 +24,18 @@
   "The full Ring handler: `handler.clj`'s own `/state` dispatch (untouched),
   plus the `POST /policy-check` (`policy.clj`), `POST /sync` (`sync.clj`),
   `GET /drift` (`query.clj`), `POST /query` (`query.clj`'s `ad-hoc-query`),
-  and `POST /rules` (`policy.clj`'s `register-rule-endpoint`) routes
-  layered in front of it, all closing over the one dev-local `conn` this
-  process holds (`/sync` also closes over `ec2-client`, an EC2 client
-  built once at process start and reused across every Sync invocation -
-  an implementation choice, not a correctness one, see design.md). Any
-  other method on `/policy-check`/`/sync`/`/drift`/`/query`/`/rules` gets
-  an explicit `405` rather than falling through to `state-handler` (which
-  knows nothing about these routes and would 404 them). Public (rather
-  than `defn-`) so it's directly testable, mirroring `handler/handler`."
+  `POST /rules` (`policy.clj`'s `register-rule-endpoint`), and `POST
+  /apply`/`POST /import`/`POST /destroy` (`terraform.clj`'s unattended
+  Terraform execution, issue #33) routes layered in front of it, all
+  closing over the one dev-local `conn` this process holds (`/sync` also
+  closes over `ec2-client`, an EC2 client built once at process start and
+  reused across every Sync invocation - an implementation choice, not a
+  correctness one, see design.md). Any other method on
+  `/policy-check`/`/sync`/`/drift`/`/query`/`/rules`/`/apply`/`/import`/
+  `/destroy` gets an explicit `405` rather than falling through to
+  `state-handler` (which knows nothing about these routes and would 404
+  them). Public (rather than `defn-`) so it's directly testable,
+  mirroring `handler/handler`."
   [conn ec2-client]
   (let [state-handler (handler/handler conn)]
     (fn [{:keys [request-method uri body] :as request}]
@@ -64,6 +68,24 @@
         (policy/register-rule-endpoint (slurp body))
 
         (= uri "/rules")
+        {:status 405 :headers {"Allow" "POST"} :body ""}
+
+        (and (= uri "/apply") (= request-method :post))
+        (terraform/apply-endpoint conn (slurp body))
+
+        (= uri "/apply")
+        {:status 405 :headers {"Allow" "POST"} :body ""}
+
+        (and (= uri "/import") (= request-method :post))
+        (terraform/import-endpoint conn (slurp body))
+
+        (= uri "/import")
+        {:status 405 :headers {"Allow" "POST"} :body ""}
+
+        (and (= uri "/destroy") (= request-method :post))
+        (terraform/destroy-endpoint conn (slurp body))
+
+        (= uri "/destroy")
         {:status 405 :headers {"Allow" "POST"} :body ""}
 
         :else

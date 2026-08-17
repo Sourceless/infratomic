@@ -68,6 +68,21 @@
     (is (= 405 (:status (handler {:request-method :get :uri "/rules"}))))
     (is (= 405 (:status (handler {:request-method :delete :uri "/rules"}))))))
 
+(deftest apply-with-a-non-post-method-is-405-not-404
+  (let [handler (main/app-handler (fresh-conn) nil)]
+    (is (= 405 (:status (handler {:request-method :get :uri "/apply"}))))
+    (is (= 405 (:status (handler {:request-method :delete :uri "/apply"}))))))
+
+(deftest import-with-a-non-post-method-is-405-not-404
+  (let [handler (main/app-handler (fresh-conn) nil)]
+    (is (= 405 (:status (handler {:request-method :get :uri "/import"}))))
+    (is (= 405 (:status (handler {:request-method :delete :uri "/import"}))))))
+
+(deftest destroy-with-a-non-post-method-is-405-not-404
+  (let [handler (main/app-handler (fresh-conn) nil)]
+    (is (= 405 (:status (handler {:request-method :get :uri "/destroy"}))))
+    (is (= 405 (:status (handler {:request-method :delete :uri "/destroy"}))))))
+
 (deftest rules-with-post-registers-a-rule
   (let [handler (main/app-handler (fresh-conn) nil)
         rule-id (keyword (str "main-test-rule-" (random-uuid)))

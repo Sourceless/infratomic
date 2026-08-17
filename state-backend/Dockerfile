@@ -14,9 +14,25 @@ RUN clojure -P -X:build
 COPY src src
 RUN clojure -T:build uber
 
+# Pinned Terraform CLI release (issue #33), downloaded in its own stage so
+# it's cached independently of the application build above - matches or
+# exceeds ../terraform/provider.tf's `required_version = ">= 1.5"`. The
+# published image (and this repo's CI, ubuntu-latest/amd64) only ever runs
+# linux/amd64, so a single fixed platform binary is fetched rather than
+# building a multi-arch image.
+FROM debian:bookworm-slim AS terraform
+ARG TERRAFORM_VERSION=1.9.8
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && curl -fsSL -o /tmp/terraform.zip \
+       "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+    && unzip /tmp/terraform.zip -d /usr/local/bin \
+    && chmod +x /usr/local/bin/terraform \
+    && rm -rf /tmp/terraform.zip /var/lib/apt/lists/*
+
 FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
 COPY --from=build /build/target/state-backend.jar /app/state-backend.jar
+COPY --from=terraform /usr/local/bin/terraform /usr/local/bin/terraform
 
 # The published image's default Datomic connection mode is `gateway` (see
 # the container-image spec's "The container's default Datomic mode is
