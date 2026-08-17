@@ -52,7 +52,8 @@
   (:import [java.net URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
            [java.nio ByteBuffer]
-           [java.time Duration]))
+           [java.time Duration]
+           [java.util.concurrent Executors TimeUnit]))
 
 ;; ---------------------------------------------------------------------------
 ;; EC2 client (ADR-0008)
@@ -758,3 +759,47 @@
   {:status  200
    :headers {"Content-Type" "application/json"}
    :body    (json/generate-string (summary->json (sync! conn client)))})
+
+;; ---------------------------------------------------------------------------
+;; Scheduled (automatic) Sync trigger (issue #31, design.md's Decisions) - a
+;; second, in-process trigger for the exact same `sync!` call
+;; `sync-endpoint`/`POST /sync` already use, running on a fixed delay
+;; alongside the on-demand HTTP trigger. No changes to `sync!` itself; wired
+;; into `-main`'s normal-startup path by `main.clj`, not here.
+;; ---------------------------------------------------------------------------
+
+(defn wrap-failure-isolated
+  "Wraps a no-arg `task` in `try/catch Throwable`: on failure, `println`s a
+  failure message (including the exception) to `*err*` and swallows it so
+  the wrapped task always returns normally. Required because a periodic
+  `ScheduledExecutorService` task silently suppresses all of its own future
+  executions the first time it throws, with no logging of its own - the
+  catch must live in the task body itself, not rely on the executor to log
+  or keep rescheduling (design.md). Catches `Throwable`, not just
+  `Exception`, so an `Error` is isolated too, not just a checked/unchecked
+  exception."
+  [task]
+  (fn []
+    (try
+      (task)
+      (catch Throwable t
+        (binding [*out* *err*]
+          (println "Scheduled Sync run failed:" (.getMessage t)))))))
+
+(defn schedule!
+  "Starts a background `ScheduledExecutorService` running `task` (a no-arg
+  fn) on a fixed delay of `interval-seconds` (may be fractional, e.g. for a
+  short test interval), first invocation immediate (initial delay `0`), so
+  a fresh or restarted process isn't stale for a full interval. Uses
+  `scheduleWithFixedDelay`, not `scheduleAtFixedRate`, so the interval is
+  measured from the end of one run to the start of the next - two runs can
+  never overlap, however long `task` itself takes (design.md). `task`
+  should already be wrapped via `wrap-failure-isolated` if a failure must
+  not stop future runs. Returns the executor, so the caller can
+  `.shutdown`/`.shutdownNow` it if it ever needs to stop the scheduler
+  (e.g. a test); callable independently of `-main`/Jetty."
+  [interval-seconds task]
+  (let [executor (Executors/newSingleThreadScheduledExecutor)
+        delay-ms (long (* interval-seconds 1000))]
+    (.scheduleWithFixedDelay executor task 0 delay-ms TimeUnit/MILLISECONDS)
+    executor))

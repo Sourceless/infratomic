@@ -21,7 +21,7 @@ A Resource entity ingested directly from LocalStack's EC2 API rather than from a
 _Avoid_: unmanaged resource, out-of-band resource, drifted resource
 
 **Sync**:
-The State Backend operation, triggered by the CLI's `sync` subcommand over HTTP (mirroring how `apply` triggers Policy Check), that queries LocalStack's EC2 and IAM APIs directly and ingests any resources not already known as Discovered Resources — runs inside the State Backend process itself so it shares the one dev-local connection the process already holds, rather than opening a second one.
+The State Backend operation, triggered either on demand (the CLI's `sync` subcommand over HTTP, mirroring how `apply` triggers Policy Check) or automatically on a fixed interval (issue #31 — an in-process `java.util.concurrent.ScheduledExecutorService`, configured via `INFRATOMIC_SYNC_INTERVAL_SECONDS`, default 300s), that queries LocalStack's EC2 and IAM APIs directly and ingests any resources not already known as Discovered Resources — runs inside the State Backend process itself so it shares the one dev-local connection the process already holds, rather than opening a second one. Known limitation: no leader election or overlap prevention across multiple State Backend instances — each instance schedules and runs Sync independently, acceptable only because today's deployment is single-instance and `sync!` is upsert-based (a hypothetical double-run wastes work but doesn't corrupt data).
 _Avoid_: discovery, ingestion, drift sync
 
 **Write Source**:

@@ -252,13 +252,29 @@ diverged from what Terraform last wrote (tagging the write
 See `docs/adr/0005-tag-managed-vs-discovered-with-resource-managed.md` and
 `docs/adr/0009-flag-drift-via-write-source-tag-and-datomic-history.md`.
 
-`POST /sync` (no request body - Sync's input is "whatever LocalStack
-currently has"):
+Sync runs two ways, producing identical results either way:
 
-```sh
-curl -X POST http://localhost:8080/sync
-# => {"discovered":[...],"updated":[...],"drifted":[...],"skipped_already_managed":N}
-```
+- **On demand**, via `POST /sync` (no request body - Sync's input is
+  "whatever LocalStack currently has"):
+
+  ```sh
+  curl -X POST http://localhost:8080/sync
+  # => {"discovered":[...],"updated":[...],"drifted":[...],"skipped_already_managed":N}
+  ```
+
+- **Automatically**, on a fixed interval, in-process, with no CLI or
+  external cron involved - started as part of the State Backend's normal
+  startup path (not when started with the `bootstrap` argument). The
+  interval is configured via `INFRATOMIC_SYNC_INTERVAL_SECONDS` (seconds,
+  default `300`); the first automatic run happens immediately at process
+  start, then repeats every configured interval, measured from the end of
+  one run to the start of the next so two runs never overlap. A failed
+  automatic run is logged to stderr and does not stop future automatic
+  runs. Every running State Backend instance runs its own scheduler
+  independently - fine for today's single-instance deployment, but see
+  `CONTEXT.md`'s "Sync" glossary entry for the known limitation this
+  implies for a multi-instance deployment (no leader election / overlap
+  prevention across instances).
 
 ## Drift detection
 
