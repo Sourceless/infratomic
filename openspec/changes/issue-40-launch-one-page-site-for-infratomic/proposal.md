@@ -27,7 +27,7 @@ The issue itself stays open after this change merges, until `https://infratomic.
 
 ## Impact
 
-- New files: a static site page and its assets (exact path decided in `design.md`), `CNAME` (repo root, per GitHub Pages' requirement that it live at the root of the published content), `.github/workflows/<pages-workflow>.yml`.
+- New files: a static site page and its assets (exact path decided in `design.md`), `CNAME` (at `site/CNAME`, per GitHub Pages' requirement that it live at the root of the *published* content, which is `site/`, not the repo root — see `design.md`), `.github/workflows/<pages-workflow>.yml`.
 - No application code (`cli/`, `state-backend/`, `dev-local-gateway/`) is touched.
 - `README.md`, `CONTEXT.md`, and `docs/` are not modified — the site reuses their content by reference/copy, not by editing them.
 - New repo-level capability: this is the first GitHub Pages deployment and the first workflow requesting `pages`/`id-token` permissions.

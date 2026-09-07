@@ -9,7 +9,7 @@
 
 ## 2. Deployment workflow
 
-- [x] 2.1 Create `.github/workflows/pages.yml`: triggers on `push` to `main` (paths-filtered to `site/**` and the workflow file itself) and `workflow_dispatch`; permissions `contents: read`, `pages: write`, `id-token: write`; steps `actions/checkout`, `actions/upload-pages-artifact` with `path: site`, `actions/deploy-pages`.
+- [x] 2.1 Create `.github/workflows/pages.yml`: triggers on `push` to `main` (paths-filtered to `site/**` and the workflow file itself) and `workflow_dispatch`; permissions `contents: read`, `pages: write`, `id-token: write`; a `concurrency` group (`pages`, `cancel-in-progress: false`) so overlapping deploys queue rather than race; steps `actions/checkout`, `actions/configure-pages`, `actions/upload-pages-artifact` with `path: site`, `actions/deploy-pages`.
 - [x] 2.2 Set the deploy job's `environment: github-pages` (with the `page_url` output) per `actions/deploy-pages`' documented usage, matching the convention other Pages-deploying repos in this org already use.
 
 ## 3. Verification
