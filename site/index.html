@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>infratomic — the logic-powered infrastructure database</title>
+  <meta
+    name="description"
+    content="infratomic: the logic-powered infrastructure database. Policy-gated terraform apply and reachability graph search today, blast-radius simulation and safe deploy ordering on the roadmap."
+  />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>infratomic</h1>
+    <p class="tagline">
+      If you treat infrastructure as data, you can test things that don't exist yet.
+    </p>
+  </header>
+
+  <main>
+    <section id="quickstart">
+      <h2>Quickstart</h2>
+      <p>
+        <code>cli/</code> is a drop-in replacement for the <code>terraform</code> binary: every
+        subcommand passes straight through to real <code>terraform</code> unchanged, except
+        <code>apply</code>, which it intercepts to run a <strong>Policy Check</strong> first. If
+        the Policy Check reports a Violation, the CLI prints it and exits non-zero without ever
+        calling real <code>terraform apply</code>; otherwise it applies exactly as
+        <code>terraform apply</code> would.
+      </p>
+      <pre><code>clojure -Sdeps '{:deps {infratomic/cli {:local/root "../cli"}}}' -M -m infratomic.cli.main -- apply</code></pre>
+    </section>
+
+    <section id="features">
+      <h2>Features</h2>
+
+      <h3>Available now</h3>
+      <ul>
+        <li>
+          <strong>Policy Checks</strong> — before a real <code>terraform apply</code> runs, the
+          plan is decomposed into a speculative Datomic database and evaluated against every
+          registered Rule. Any Violation is reported and the apply is blocked; a clean check lets
+          it through unchanged.
+        </li>
+        <li>
+          <strong>Reachability (graph search)</strong> — recursive graph search over deployed
+          infrastructure answers whether one Workload can reach another (or the public internet)
+          across the network graph, and whether a given Principal is IAM-reachable for an action
+          across the IAM policy graph — both as structural Datalog queries, not JSON-blob scans.
+        </li>
+      </ul>
+
+      <h3>On the roadmap</h3>
+      <ul>
+        <li>Blast-radius simulation — see what a change would actually affect before it ships.</li>
+        <li>
+          A safe-deploy-ordering solver — work out the order to roll changes out so nothing gets
+          stranded mid-deploy.
+        </li>
+        <li>
+          Reachability auto-fix — don't just find that something's reachable that shouldn't be;
+          propose the fix.
+        </li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      <a href="https://github.com/Sourceless/infratomic">infratomic on GitHub</a>
+      ·
+      <a href="https://github.com/Sourceless/infratomic/blob/main/LICENSE">Apache License 2.0</a>
+    </p>
+  </footer>
+</body>
+</html>
