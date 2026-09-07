@@ -1,0 +1,44 @@
+name: Deploy site to GitHub Pages
+
+# Publishes site/ (a static, build-step-free HTML/CSS page — see site/)
+# to GitHub Pages using only the workflow's built-in GITHUB_TOKEN via
+# OIDC - no externally-provisioned secret is configured or required.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment, skipping runs queued between an
+# in-progress run and the latest queued one; do not cancel an in-progress
+# run, since we want to allow production deployments to complete.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
