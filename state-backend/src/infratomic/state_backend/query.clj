@@ -356,6 +356,44 @@
                  db))))
 
 ;; ---------------------------------------------------------------------------
+;; Reconciliation-only companion query (issue #34): resolves the specific
+;; violating child entity for a Rule whose own :rule/find only binds the
+;; parent - see design.md's "Child-binding companion query" decision. Not
+;; registered in policy.clj's rule-registry; only ever called from
+;; reconcile.clj.
+;; ---------------------------------------------------------------------------
+
+(defn offending-port-22-rules-for-sg
+  "Every specific `aws_security_group_rule` entity (`resource-summary-
+  pattern`-shaped) belonging to the security group identified by
+  `sg-resource-id` (its `:resource/id`) that matches the same port-22/
+  `0.0.0.0/0` predicate `policy.clj`'s `security-groups-with-port-22-open-
+  rule` (and this namespace's `security-groups-with-port-22-open`) both
+  already encode - the reconciliation-only companion query that resolves
+  the concrete remediation target for a Rule whose own result binds only
+  the parent security group (design.md's \"child-binding companion
+  query\" decision). Duplicates the shape of the existing predicate
+  rather than sharing a definition with it, since the two consumers want
+  different result granularity (bind `?sg` vs. bind `?rule`). A security
+  group with both an offending and a non-offending ingress rule returns
+  only the offending one."
+  [db sg-resource-id]
+  (map #(d/pull db resource-summary-pattern %)
+       (map first
+            (d/q '[:find ?rule
+                   :in $ ?sg-resource-id
+                   :where
+                   [?sg :resource/id ?sg-resource-id]
+                   [?sg :aws-security-group/id ?sg-id]
+                   [?rule :aws-security-group-rule/security-group-id ?sg-id]
+                   [?rule :aws-security-group-rule/from-port ?from]
+                   [?rule :aws-security-group-rule/to-port ?to]
+                   [?rule :aws-security-group-rule/cidr-block "0.0.0.0/0"]
+                   [(<= ?from 22)]
+                   [(>= ?to 22)]]
+                 db sg-resource-id))))
+
+;; ---------------------------------------------------------------------------
 ;; Network reachability
 ;; ---------------------------------------------------------------------------
 

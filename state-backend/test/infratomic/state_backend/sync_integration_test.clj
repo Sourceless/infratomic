@@ -31,6 +31,7 @@
             [infratomic.state-backend.db :as db]
             [infratomic.state-backend.handler :as handler]
             [infratomic.state-backend.main :as main]
+            [infratomic.state-backend.policy :as policy]
             [infratomic.state-backend.query :as query]
             [infratomic.state-backend.sync :as sync]
             [ring.adapter.jetty :as jetty]))
@@ -702,5 +703,204 @@
                   (is (not (contains? (into #{} (map #(get % "id")) (get body "discovered"))
                                        "aws_security_group.ssh_open")))
                   (is (pos? (get body "skipped_already_managed")))))
+              (finally
+                (aws/stop client)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Reconciliation end-to-end (issue #34): sync/sync! now runs
+;; reconcile/reconcile! as its final step (sync.clj), so every scenario
+;; below drives it via a real sync! call against real LocalStack - no
+;; separate reconcile trigger exists. Both the built-in
+;; security-groups-with-port-22-open Rule (already registered at process
+;; load) and the sample app's own aws_security_group.ssh_open/
+;; ssh_open_ingress fixture are always in play alongside whatever each test
+;; below sets up - harmless, since the sample app's own SG rule is
+;; managed-and-non-drifted (action :none, no Terraform call) unless a test
+;; deliberately drifts something else.
+;; ---------------------------------------------------------------------------
+
+(defn- reconciliation-records-for-sg
+  "Every `:reconciliation/*` entity whose target resource is the specific
+  `aws_security_group_rule` child belonging to security group `sg-id` -
+  the child-binding companion query's resolution target for the built-in
+  port-22 Rule (design.md's \"child-binding companion query\" decision),
+  never the parent security group itself."
+  [db sg-id]
+  (d/q '[:find (pull ?e [:reconciliation/action])
+         :in $ ?sg-id
+         :where
+         [?e :reconciliation/resource ?r]
+         [?r :aws-security-group-rule/security-group-id ?sg-id]]
+       db sg-id))
+
+(defn- invocation-import-destroy-for-sg
+  [db sg-id]
+  (d/q '[:find ?success
+         :in $ ?sg-id
+         :where
+         [?r :aws-security-group-rule/security-group-id ?sg-id]
+         [?r :resource/id ?rid]
+         [?e :invocation/resource-address ?rid]
+         [?e :invocation/command :import-destroy]
+         [?e :invocation/success? ?success]]
+       db sg-id))
+
+;; NOTE (issue #34 implementation finding): both scenarios below drive
+;; reconciliation's dispatch/recording correctly all the way through a
+;; real synthesized import+destroy attempt for the specific offending
+;; `aws_security_group_rule` child (confirmed by the reconciliation record
+;; and Invocation this codebase itself produces) - but the underlying
+;; `terraform plan -generate-config-out` step for that resource type
+;; currently, reproducibly fails against the real `hashicorp/aws`
+;; provider (confirmed directly, independent of these tests, against both
+;; the pinned `~> 5.0` and the latest available provider version: it
+;; always emits an explicit `self = false` alongside `cidr_blocks`/
+;; `source_security_group_id`, which the resource's own schema then
+;; rejects as "Conflicting configuration arguments" - see
+;; terraform_integration_test.clj's
+;; `synthesize-import-and-destroy-resolves-an-sg-rules-composite-import-id-
+;; against-the-real-object` for the isolated reproduction). This is
+;; exactly the kind of "generation gap... surfaces as a normal Invocation
+;; failure, not silent data loss" outcome design.md's Risks/Trade-offs
+;; section already anticipates - reconciliation itself behaves correctly
+;; (records the attempt, leaves the resource as-is, no dangling scratch
+;; state), but the rule is not actually destroyed by this pass, an
+;; upstream provider limitation outside this codebase's control. Posted
+;; as a finding on issue #34.
+
+(deftest sync-reconciles-a-brand-new-out-of-band-security-groups-open-port-22-rule
+  (with-state-backend-server
+    (fn [conn]
+      (with-applied-sample-app
+        (fn []
+          (let [client (sync/ec2-client)
+                sg-id  (create-out-of-band-security-group! client)]
+            (try
+              (sync/sync! conn client)
+              (testing "a reconciliation record for the offending rule has action :import-destroy"
+                (is (some #(= :reconciliation.action/import-destroy (:reconciliation/action (first %)))
+                          (reconciliation-records-for-sg (d/db conn) sg-id))))
+              (testing "an Invocation was recorded for the attempted synthesized import+destroy"
+                (is (seq (invocation-import-destroy-for-sg (d/db conn) sg-id))))
+              (finally
+                (aws/invoke client {:op :DeleteSecurityGroup :request {:GroupId sg-id}})
+                (aws/stop client)))))))))
+
+(deftest sync-reconciles-new-child-drift-a-rogue-ingress-rule-on-an-already-managed-security-group
+  (with-state-backend-server
+    (fn [conn]
+      (with-applied-sample-app
+        (fn []
+          (let [client (sync/ec2-client)
+                sg-id  (security-group-id-by-name client "infratomic-test-app-https-only")]
+            (aws/invoke client {:op :AuthorizeSecurityGroupIngress
+                                 :request {:GroupId sg-id
+                                           :IpPermissions [{:IpProtocol "tcp" :FromPort 22 :ToPort 22
+                                                             :IpRanges [{:CidrIp "0.0.0.0/0"}]}]}})
+            (try
+              (sync/sync! conn client)
+              (testing "the managed security group itself is untouched by a bare apply on the parent - it still exists"
+                (is (seq (:SecurityGroups (aws/invoke client {:op :DescribeSecurityGroups :request {:GroupIds [sg-id]}})))))
+              (testing "a reconciliation record for the rogue rule has action :import-destroy, targeting the child not the parent"
+                (is (some #(= :reconciliation.action/import-destroy (:reconciliation/action (first %)))
+                          (reconciliation-records-for-sg (d/db conn) sg-id))))
+              (testing "an Invocation was recorded for the attempted synthesized import+destroy"
+                (is (seq (invocation-import-destroy-for-sg (d/db conn) sg-id))))
+              (finally
+                (aws/invoke client {:op :RevokeSecurityGroupIngress
+                                     :request {:GroupId sg-id
+                                               :IpPermissions [{:IpProtocol "tcp" :FromPort 22 :ToPort 22
+                                                                 :IpRanges [{:CidrIp "0.0.0.0/0"}]}]}})
+                (aws/stop client)))))))))
+
+(deftest sync-reconciles-a-managed-drifted-policy-violating-resource-via-apply
+  (with-state-backend-server
+    (fn [conn]
+      (with-applied-sample-app
+        (fn []
+          (let [client     (sync/ec2-client)
+                rule-id    (keyword (str "test-rule-" (random-uuid)))
+                rt-a-id    (route-table-id-by-name client "infratomic-test-app-rt-a")
+                vpc-a-id   (-> (aws/invoke client {:op :DescribeRouteTables :request {:RouteTableIds [rt-a-id]}})
+                                :RouteTables first :VpcId)
+                new-igw-id (-> (aws/invoke client {:op :CreateInternetGateway}) :InternetGateway :InternetGatewayId)]
+            ;; A permissive Rule flagging every aws_route as violating
+            ;; (independent of whether it's drifted) - so rt_a_igw is both
+            ;; policy-violating and, once drifted below, actually drifted.
+            (policy/register-rule! {:rule/id    rule-id
+                                     :rule/find  '[?e]
+                                     :rule/in    '[$]
+                                     :rule/where '[[?e :aws-route/route-table-id _]]})
+            (aws/invoke client {:op :AttachInternetGateway :request {:InternetGatewayId new-igw-id :VpcId vpc-a-id}})
+            (aws/invoke client {:op :ReplaceRoute
+                                 :request {:RouteTableId rt-a-id :DestinationCidrBlock "0.0.0.0/0"
+                                           :GatewayId new-igw-id}})
+            (try
+              (sync/sync! conn client)
+              (let [db (d/db conn)]
+                (testing "an Invocation with command :apply was recorded for the drifted, policy-violating route"
+                  (is (seq (d/q '[:find ?e :in $ ?a
+                                   :where [?e :invocation/resource-address ?a]
+                                          [?e :invocation/command :apply]
+                                          [?e :invocation/success? true]]
+                                 db "aws_route.rt_a_igw"))))
+                (testing "a reconciliation record with action :apply exists for it, under this Rule"
+                  (is (seq (d/q '[:find ?e :in $ ?rule ?id
+                                   :where [?e :reconciliation/rule ?rule]
+                                          [?e :reconciliation/action :reconciliation.action/apply]
+                                          [?e :reconciliation/resource ?r]
+                                          [?r :resource/id ?id]]
+                                 db rule-id "aws_route.rt_a_igw")))))
+              (finally
+                (swap! policy/rule-registry dissoc rule-id)
+                (aws/stop client)))))))))
+
+(deftest sync-records-only-for-a-managed-non-drifted-resource-violating-a-newly-registered-rule
+  (with-state-backend-server
+    (fn [conn]
+      (with-applied-sample-app
+        (fn []
+          (let [client  (sync/ec2-client)
+                rule-id (keyword (str "test-rule-" (random-uuid)))]
+            ;; Flags every deployed VPC as violating, independent of drift -
+            ;; the sample app's aws_vpc.vpc_a is managed and (nothing in this
+            ;; test touches it) never drifted.
+            (policy/register-rule! {:rule/id    rule-id
+                                     :rule/find  '[?e]
+                                     :rule/in    '[$]
+                                     :rule/where '[[?e :aws-vpc/cidr-block "10.0.0.0/16"]]})
+            (try
+              (sync/sync! conn client)
+              (let [db (d/db conn)]
+                (testing "a reconciliation record with action :none exists for the matching managed VPC"
+                  (is (seq (d/q '[:find ?e :in $ ?rule ?id
+                                   :where [?e :reconciliation/rule ?rule]
+                                          [?e :reconciliation/action :reconciliation.action/none]
+                                          [?e :reconciliation/resource ?r]
+                                          [?r :resource/id ?id]]
+                                 db rule-id "aws_vpc.vpc_a"))))
+                (testing "no Invocation was created targeting it"
+                  (is (empty? (d/q '[:find ?e :in $ ?a :where [?e :invocation/resource-address ?a]]
+                                    db "aws_vpc.vpc_a")))))
+              (finally
+                (swap! policy/rule-registry dissoc rule-id)
+                (aws/stop client)))))))))
+
+(deftest sync-produces-no-invocation-or-reconciliation-record-for-a-fully-compliant-resource
+  (with-state-backend-server
+    (fn [conn]
+      (with-applied-sample-app
+        (fn []
+          (let [client (sync/ec2-client)]
+            (try
+              (sync/sync! conn client)
+              (let [db (d/db conn)]
+                (testing "no reconciliation record exists for the compliant https_only security group"
+                  (is (empty? (d/q '[:find ?e :in $ ?id
+                                      :where [?e :reconciliation/resource ?r] [?r :resource/id ?id]]
+                                    db "aws_security_group.https_only"))))
+                (testing "no Invocation was created targeting it"
+                  (is (empty? (d/q '[:find ?e :in $ ?a :where [?e :invocation/resource-address ?a]]
+                                    db "aws_security_group.https_only")))))
               (finally
                 (aws/stop client)))))))))

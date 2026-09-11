@@ -2,9 +2,10 @@
   "Unattended Terraform execution (issue #33): `apply!`/`import!`/`destroy!`
   each shell out to the real `terraform` binary, non-interactively, against
   a caller-supplied working directory - the primitive the reconciliation
-  engine (#34) will call to actually remediate drift, once it exists. This
-  namespace only executes; deciding *when* to call `apply!`/`import!`/
-  `destroy!` is #34's job entirely (see proposal.md's Non-Goals).
+  engine (`infratomic.state-backend.reconcile`, issue #34) calls to
+  actually remediate a policy violation. This namespace only executes;
+  deciding *when* to call `apply!`/`import!`/`destroy!` is reconcile.clj's
+  job entirely (see proposal.md's Non-Goals).
 
   Every call is wrapped, uniformly, by `with-lock-and-invocation`:
   1. Acquire a per-resource-address lock (`acquire-lock!`, blocking/
@@ -25,7 +26,19 @@
   invoking this apply on behalf of, so it locks/logs consistently with
   `import!`/`destroy!` (see the terraform-execution spec's \"Every
   invocation is recorded\" requirement, generic across all three
-  commands)."
+  commands).
+
+  `synthesize-import-and-destroy!` (issue #34, `terraform-config-
+  synthesis` capability) is a fourth, separate Terraform-invoking
+  sequence for a previously-unmanaged (or offending child) resource:
+  Terraform's own `import` block plus `terraform plan
+  -generate-config-out` plus `apply` plus `destroy`, run entirely within
+  a fresh scratch working directory discarded unconditionally afterward -
+  see that fn's docstring. It reuses `with-lock-and-invocation` (so
+  locking/audit stays uniform across all four Terraform-invoking paths)
+  but is deliberately not built on `import!` (whose contract is \"fails
+  if no config block exists\" - synthesis is what makes that block exist
+  in the first place)."
   (:require [cheshire.core :as json]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
@@ -239,6 +252,165 @@
   [conn working-dir address]
   (with-lock-and-invocation conn :destroy address
     #(run-terraform! working-dir ["destroy" "-auto-approve" (str "-target=" address)])))
+
+;; ---------------------------------------------------------------------------
+;; Config synthesis (issue #34, terraform-config-synthesis capability):
+;; brings a previously-unmanaged resource (or offending child resource)
+;; under Terraform's control just long enough to destroy it, using
+;; Terraform's own native `import` block + `terraform plan
+;; -generate-config-out` + `apply` to generate its configuration from live
+;; state - no attribute-map-to-HCL serialization is authored by this
+;; codebase (design.md's "Config synthesis" decision).
+;; ---------------------------------------------------------------------------
+
+(def ^:private id-space-mismatched-import-id-builders
+  "Per-Terraform-resource-type composite import-id builder, for the subset
+  of `db/id-space-mismatched-types` this reconciliation path ever
+  synthesizes an import for (`aws_security_group_rule`, `aws_route`) - a
+  small data-driven table (design.md's \"Import id derivation\" decision),
+  not a generalized attribute-to-id DSL. Each fn takes the resource's
+  stored (Terraform-attribute-key-shaped, string-keyed) attribute map and
+  returns Terraform's synthetic composite import id string for that type -
+  never that type's own stored `\"id\"`, which (for a Discovered instance
+  of either type) is the raw AWS-assigned id, a different id space
+  entirely (see `db/resource-composite-key`'s docstring)."
+  {"aws_security_group_rule"
+   (fn [{:strs [security_group_id type protocol from_port to_port
+                cidr_blocks source_security_group_id]}]
+     (let [source (or (first cidr_blocks) source_security_group_id)]
+       (str/join "_" [security_group_id type protocol from_port to_port source])))
+
+   "aws_route"
+   (fn [{:strs [route_table_id destination_cidr_block]}]
+     (str route_table_id "_" destination_cidr_block))})
+
+(defn import-id
+  "The Terraform import id for a resource of `type` given its stored,
+  Terraform-attribute-key-shaped `attributes` map (`db/stored-attributes`'s
+  shape) - that type's own stored `\"id\"` attribute directly, used
+  verbatim, unless `type` has an entry in
+  `id-space-mismatched-import-id-builders`, in which case its composite-id
+  builder derives the id instead (terraform-config-synthesis spec's \"The
+  import id is derived per resource type's id-space\" requirement)."
+  [type attributes]
+  (if-let [builder (get id-space-mismatched-import-id-builders type)]
+    (builder attributes)
+    (get attributes "id")))
+
+(defn- scratch-provider-config
+  "Minimal Terraform configuration for a scratch synthesis working
+  directory: the `aws` provider, pointed at LocalStack exactly like the
+  sample app's own `terraform/provider.tf` (EC2 endpoint only - every
+  synthesized-import type this reconciliation path covers is EC2-modeled).
+  Deliberately no `backend` block - defaults to local state, which is
+  fine, since the scratch directory (state file included) is discarded
+  unconditionally once the sequence completes (terraform-config-synthesis
+  spec's \"isolated, per-invocation scratch working directory\"
+  requirement); this never talks to the shared State Backend `/state`
+  endpoint the way the real sample app's `http` backend does."
+  []
+  (str "terraform {\n"
+       "  required_providers {\n"
+       "    aws = {\n"
+       "      source  = \"hashicorp/aws\"\n"
+       "      version = \"~> 5.0\"\n"
+       "    }\n"
+       "  }\n"
+       "}\n\n"
+       "provider \"aws\" {\n"
+       "  region = \"us-east-1\"\n\n"
+       "  access_key = \"test\"\n"
+       "  secret_key = \"test\"\n\n"
+       "  skip_credentials_validation = true\n"
+       "  skip_metadata_api_check     = true\n"
+       "  skip_requesting_account_id  = true\n\n"
+       "  endpoints {\n"
+       "    ec2 = \"http://localhost:4566\"\n"
+       "  }\n"
+       "}\n"))
+
+(defn- import-block
+  "The minimal `import { to = ... id = ... }` HCL block this codebase
+  authors directly (the only HCL it ever writes for synthesis - the
+  resource's own configuration body is generated by `terraform plan
+  -generate-config-out`, not by this fn). `address` is written unquoted -
+  the `to` field is an HCL resource reference, not a string - reusing the
+  target resource's existing `:resource/id` verbatim (already
+  `<type>.<name>`-shaped, terraform-config-synthesis spec's \"import
+  block's target address reuses the resource's existing identifier\"
+  requirement); `id` is `pr-str`-encoded so any embedded characters (e.g.
+  a CIDR block's `/`) round-trip as a correctly quoted/escaped HCL
+  string."
+  [address id]
+  (str "import {\n"
+       "  to = " address "\n"
+       "  id = " (pr-str id) "\n"
+       "}\n"))
+
+(defn- create-scratch-dir!
+  "Creates a fresh temp directory, distinct from the shared working
+  directory `apply!` reconciliation uses, and writes its minimal
+  provider configuration (`scratch-provider-config`) into it. Returns the
+  directory's path."
+  []
+  (let [dir (str (System/getProperty "java.io.tmpdir") "/infratomic-synthesis-" (random-uuid))]
+    (.mkdirs (java.io.File. ^String dir))
+    (spit (str dir "/provider.tf") (scratch-provider-config))
+    dir))
+
+(defn- delete-recursively!
+  "Discards `dir` and everything in it - `file-seq`'s parent-before-
+  children order reversed so every file is deleted before the directory
+  containing it (a `finally`-safe cleanup step: never throws even if some
+  path couldn't be created in the first place, since `file-seq` over a
+  nonexistent path returns empty)."
+  [^String dir]
+  (doseq [^java.io.File f (reverse (file-seq (java.io.File. dir)))]
+    (.delete f)))
+
+(defn synthesize-import-and-destroy!
+  "Runs the full synthesized import+destroy sequence for `address`
+  (the target resource's `:resource/id`, e.g. an unmanaged Discovered
+  Resource or a New-Child-Drift child) of Terraform `type`, given its
+  stored `attributes` map - entirely within a fresh scratch working
+  directory (`create-scratch-dir!`), discarded unconditionally in a
+  `finally` regardless of where the sequence succeeded or failed
+  (terraform-config-synthesis spec's \"scratch working directory is
+  discarded after a failed synthesis\" requirement):
+  1. Write the `import` block (`import-block`, `import-id`-derived id).
+  2. `terraform init` (the scratch directory is created fresh every
+     call, so it's never already initialized).
+  3. `terraform plan -generate-config-out=generated.tf` - the provider
+     generates the resource's configuration from live state.
+  4. `terraform apply -auto-approve` - binds the resource under
+     Terraform management in this scratch directory's own state.
+  5. `terraform destroy -auto-approve -target=<address>`.
+  Short-circuits (returning that step's own failed result) on the first
+  step that fails, still running the `finally` cleanup. Wrapped by the
+  same `with-lock-and-invocation` `apply!`/`import!`/`destroy!` use
+  (command `:import-destroy`), so locking and Invocation-recording stay
+  uniform across every Terraform-invoking path - the scratch directory
+  only changes *where* Terraform runs, not how the invocation is locked
+  or audited. Returns `{:success true/false :out ... :err ...}`, the
+  last step attempted's own result."
+  [conn address type attributes]
+  (with-lock-and-invocation conn :import-destroy address
+    (fn []
+      (let [dir (create-scratch-dir!)]
+        (try
+          (spit (str dir "/import.tf") (import-block address (import-id type attributes)))
+          (let [init-result (run-terraform! dir ["init" "-input=false"])]
+            (if-not (:success init-result)
+              init-result
+              (let [plan-result (run-terraform! dir ["plan" "-generate-config-out=generated.tf" "-input=false"])]
+                (if-not (:success plan-result)
+                  plan-result
+                  (let [apply-result (run-terraform! dir ["apply" "-auto-approve"])]
+                    (if-not (:success apply-result)
+                      apply-result
+                      (run-terraform! dir ["destroy" "-auto-approve" (str "-target=" address)])))))))
+          (finally
+            (delete-recursively! dir)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; HTTP request validation (issue #33 code review, finding #1/#2): the HTTP

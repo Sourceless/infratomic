@@ -15,6 +15,7 @@
             [infratomic.state-backend.policy-test]
             [infratomic.state-backend.query-test]
             [infratomic.state-backend.query-integration-test]
+            [infratomic.state-backend.reconcile-test]
             [infratomic.state-backend.sync-test]
             [infratomic.state-backend.sync-integration-test]
             [infratomic.state-backend.terraform-test]
@@ -32,6 +33,7 @@
                                               'infratomic.state-backend.main-test
                                               'infratomic.state-backend.policy-test
                                               'infratomic.state-backend.query-test
+                                              'infratomic.state-backend.reconcile-test
                                               'infratomic.state-backend.sync-test
                                               'infratomic.state-backend.terraform-test
                                               'infratomic.state-backend.validator-test)]

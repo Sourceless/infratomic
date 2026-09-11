@@ -14,6 +14,7 @@
   separately by `terraform-integration-test` (not part of this hermetic
   suite, see `test_runner.clj`)."
   (:require [cheshire.core :as json]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [datomic.client.api :as d]
             [infratomic.state-backend.db :as db]
@@ -337,3 +338,67 @@
                                                       "resource_address"  "aws_s3_bucket.uploads"
                                                       "aws_id"            "--evil-flag"}))]
     (is (= 400 (:status response)))))
+
+;; ---------------------------------------------------------------------------
+;; Config synthesis (issue #34): import-id derivation, scratch dir
+;; creation/cleanup, and synthesize-import-and-destroy!'s hermetic
+;; failure/cleanup behavior. Real terraform init/plan/apply/destroy against
+;; a live LocalStack is covered separately by terraform-integration-test
+;; (not part of the hermetic suite).
+;; ---------------------------------------------------------------------------
+
+(deftest import-id-passes-through-the-stored-id-for-an-id-space-matched-type
+  (is (= "sg-123" (terraform/import-id "aws_security_group" {"id" "sg-123" "vpc_id" "vpc-a"}))))
+
+(deftest import-id-builds-a-composite-id-for-an-sg-rule-with-a-cidr-source
+  (is (= "sg-123_ingress_tcp_22_22_0.0.0.0/0"
+         (terraform/import-id "aws_security_group_rule"
+                               {"security_group_id" "sg-123" "type" "ingress" "protocol" "tcp"
+                                "from_port" 22 "to_port" 22 "cidr_blocks" ["0.0.0.0/0"]}))))
+
+(deftest import-id-builds-a-composite-id-for-an-sg-rule-with-a-source-security-group
+  (is (= "sg-123_egress_tcp_9999_9999_sg-456"
+         (terraform/import-id "aws_security_group_rule"
+                               {"security_group_id" "sg-123" "type" "egress" "protocol" "tcp"
+                                "from_port" 9999 "to_port" 9999 "source_security_group_id" "sg-456"}))))
+
+(deftest import-id-builds-a-composite-id-for-a-route
+  (is (= "rtb-123_10.0.0.0/16"
+         (terraform/import-id "aws_route" {"route_table_id" "rtb-123" "destination_cidr_block" "10.0.0.0/16"}))))
+
+(deftest create-scratch-dir-writes-provider-config-and-delete-recursively-removes-everything
+  (let [dir (#'terraform/create-scratch-dir!)]
+    (is (.exists (java.io.File. ^String dir)))
+    (is (.exists (java.io.File. (str dir "/provider.tf"))))
+    (#'terraform/delete-recursively! dir)
+    (is (not (.exists (java.io.File. ^String dir))))))
+
+(deftest delete-recursively-on-a-nonexistent-dir-is-a-no-op
+  (is (nil? (#'terraform/delete-recursively!
+             (str (System/getProperty "java.io.tmpdir") "/does-not-exist-" (random-uuid))))))
+
+(defn- tmp-synthesis-dir-count
+  []
+  (count (filter (fn [^java.io.File f]
+                    (and (.isDirectory f) (str/starts-with? (.getName f) "infratomic-synthesis-")))
+                  (.listFiles (java.io.File. (System/getProperty "java.io.tmpdir"))))))
+
+(deftest synthesize-import-and-destroy-reports-failure-without-throwing-and-cleans-up-its-scratch-dir
+  ;; Hermetic: whether or not `terraform` is on PATH, `terraform init`
+  ;; against a provider needing network access to the registry (unavailable
+  ;; in this sandboxed test environment) fails cleanly - run-terraform!
+  ;; catches/reports it rather than throwing (see
+  ;; a-failing-invocation-is-reported-as-a-failure-map-not-an-exception
+  ;; above), and the scratch directory is still discarded afterward.
+  (let [conn         (fresh-conn)
+        address      "aws_security_group.discovered-sg-999"
+        before-count (tmp-synthesis-dir-count)
+        result       (terraform/synthesize-import-and-destroy!
+                      conn address "aws_security_group" {"id" "sg-999" "vpc_id" "vpc-a"})]
+    (is (map? result))
+    (is (contains? result :success))
+    (is (= before-count (tmp-synthesis-dir-count)))
+    (testing "an Invocation entity was still recorded"
+      (let [entries (invocations (d/db conn) address)]
+        (is (= 1 (count entries)))
+        (is (= :import-destroy (:invocation/command (first entries))))))))

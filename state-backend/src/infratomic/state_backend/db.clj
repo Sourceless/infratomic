@@ -329,7 +329,7 @@
     {:db/ident       :invocation/command
      :db/valueType   :db.type/keyword
      :db/cardinality :db.cardinality/one
-     :db/doc         "Which Terraform operation this invocation ran: :apply, :import, or :destroy."}
+     :db/doc         "Which Terraform operation this invocation ran: :apply, :import, :destroy, or (issue #34) :import-destroy - the synthesized import-then-destroy sequence terraform.clj's synthesize-import-and-destroy! runs, as a single locked/logged invocation."}
     {:db/ident       :invocation/resource-address
      :db/valueType   :db.type/string
      :db/cardinality :db.cardinality/one
@@ -351,7 +351,36 @@
     {:db/ident       :lock/acquired-at
      :db/valueType   :db.type/instant
      :db/cardinality :db.cardinality/one
-     :db/doc         "When the currently-held lock for this address was acquired - used to compute staleness. Absent (entity exists but this attribute doesn't, immediately after `ensure-lock-entity!` and before the acquiring `:db/cas` transacts) means the lock is currently free."}]
+     :db/doc         "When the currently-held lock for this address was acquired - used to compute staleness. Absent (entity exists but this attribute doesn't, immediately after `ensure-lock-entity!` and before the acquiring `:db/cas` transacts) means the lock is currently free."}
+
+    ;; Policy reconciliation (issue #34): the final step of every Sync pass
+    ;; evaluates every registered policy Rule against live state directly
+    ;; (independent of drift) and, for each violating resource, dispatches
+    ;; remediation and records the decision unconditionally as a
+    ;; Reconciliation entity - see infratomic.state-backend.reconcile.
+    ;; Distinct from Invocation (an execution attempt) - a Reconciliation
+    ;; entity is a finding-plus-decision, one per violating resource per
+    ;; pass, whether or not it produced an Invocation.
+    {:db/ident       :reconciliation/resource
+     :db/valueType   :db.type/ref
+     :db/cardinality :db.cardinality/one
+     :db/doc         "The Resource entity this reconciliation decision was made about - the concrete remediation target (e.g. the specific offending child rule, not its parent security group, for a Rule resolved via a child-binding companion query)."}
+    {:db/ident       :reconciliation/rule
+     :db/valueType   :db.type/keyword
+     :db/cardinality :db.cardinality/one
+     :db/doc         "The violated Rule's :rule/id (policy.clj's rule-registry key)."}
+    {:db/ident       :reconciliation/action
+     :db/valueType   :db.type/keyword
+     :db/cardinality :db.cardinality/one
+     :db/doc         "The remediation action taken for this violation: :reconciliation.action/apply (managed and drifted), :reconciliation.action/import-destroy (not managed), or :reconciliation.action/none (managed and not drifted - recorded only, no action taken)."}
+    {:db/ident       :reconciliation/invocation
+     :db/valueType   :db.type/ref
+     :db/cardinality :db.cardinality/one
+     :db/doc         "The Invocation entity the action produced, when one was (:apply/:import-destroy) - absent for :reconciliation.action/none."}
+    {:db/ident       :reconciliation/at
+     :db/valueType   :db.type/instant
+     :db/cardinality :db.cardinality/one
+     :db/doc         "When this reconciliation decision was made."}]
    modeled-schema))
 
 (defn storage-dir

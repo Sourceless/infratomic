@@ -48,7 +48,8 @@
             [cognitect.aws.credentials :as credentials]
             [cognitect.aws.http :as aws-http]
             [infratomic.state-backend.datomic :as d]
-            [infratomic.state-backend.db :as db])
+            [infratomic.state-backend.db :as db]
+            [infratomic.state-backend.reconcile :as reconcile])
   (:import [java.net URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
            [java.nio ByteBuffer]
@@ -708,7 +709,14 @@
   (`resource-tx`), transacts every resulting tx-data plus the
   presence-marker tx-data (`missing-child-tx`, one per `sync-present-types`
   type, covering both Terraform-managed and Discovered resources of that
-  type - issue #32 PR #36 round-4 review fix) in one transaction. Returns a summary map:
+  type - issue #32 PR #36 round-4 review fix) in one transaction, then
+  runs Reconciliation (`reconcile/reconcile!`, issue #34) as its final
+  step - for both on-demand (`sync-endpoint`/`POST /sync`) and scheduled
+  (`schedule!`) invocations alike, since both call this same fn. A
+  reconciliation failure propagates like any other failure in this
+  fn - `wrap-failure-isolated` (below) isolates it from the scheduler
+  exactly as it already isolates a Sync failure, with no reconciliation-
+  specific handling needed. Returns a summary map:
   `{:discovered [{:type :id} ...] :updated [{:type :id} ...] :drifted
   [{:type :id} ...] :skipped-already-managed <count>}`. `:drifted` lists
   each Terraform-managed resource whose observed live value differed from
@@ -727,6 +735,7 @@
         tx-data    (into (into [] (mapcat :tx-data) decisions) missing-tx)]
     (when (seq tx-data)
       (d/transact conn {:tx-data tx-data}))
+    (reconcile/reconcile! conn)
     {:discovered              (mapv :entry (filter #(= :discovered (:outcome %)) decisions))
      :updated                 (mapv :entry (filter #(= :updated (:outcome %)) decisions))
      :drifted                 (mapv :entry (filter #(= :drifted (:outcome %)) decisions))
