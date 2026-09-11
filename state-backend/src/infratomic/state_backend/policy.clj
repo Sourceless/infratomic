@@ -201,11 +201,16 @@
   (cond-> {:find find :where where}
     in (assoc :in in)))
 
-(defn- run-rule
+(defn run-rule
   "Run one stored Rule's query against `db`, returning the seq of values
   bound to its single `:rule/find` variable - `d/q`'s raw `[[v] [v] ...]`
   result set flattened to `[v v ...]`. Passes `:rule/rule-defs` as the `%`
-  argument when present, matching `:rule/in`'s `[$ %]` shape."
+  argument when present, matching `:rule/in`'s `[$ %]` shape. Public
+  (rather than `defn-`) - `db`-value-agnostic by construction, so
+  `reconcile.clj` (issue #34) reuses it as-is to evaluate the registry
+  against live state directly, not just `evaluate`'s speculative
+  plan-derived db (design.md's \"Live-state Rule evaluation reuses
+  policy.clj's run-rule, not evaluate\" decision)."
   [db {:rule/keys [rule-defs] :as rule}]
   (let [query (rule->query-map rule)
         args  (cond-> [db] (seq rule-defs) (conj rule-defs))]

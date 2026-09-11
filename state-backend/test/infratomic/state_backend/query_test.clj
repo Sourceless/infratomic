@@ -114,6 +114,34 @@
            (ids (query/security-groups-with-port-22-open db))))))
 
 ;; ---------------------------------------------------------------------------
+;; offending-port-22-rules-for-sg - the reconciliation-only companion query
+;; (issue #34) that resolves the specific violating child rule for a
+;; security group, distinct from the Rule itself (which only binds the
+;; parent security group).
+;; ---------------------------------------------------------------------------
+
+(deftest offending-port-22-rules-for-sg-returns-only-the-offending-rule
+  (let [conn (fresh-conn)]
+    (handler/post-state
+     conn
+     (state-body [(resource "aws_security_group" "mixed" {"id" "sg-mixed"})
+                  (resource "aws_security_group_rule" "mixed_ssh_open"
+                            {"from_port"         22
+                             "to_port"            22
+                             "protocol"           "tcp"
+                             "security_group_id"  "sg-mixed"
+                             "cidr_blocks"        ["0.0.0.0/0"]})
+                  (resource "aws_security_group_rule" "mixed_https_only"
+                            {"from_port"         443
+                             "to_port"            443
+                             "protocol"           "tcp"
+                             "security_group_id"  "sg-mixed"
+                             "cidr_blocks"        ["0.0.0.0/0"]})]))
+    (let [db (d/db conn)]
+      (is (= #{"aws_security_group_rule.mixed_ssh_open"}
+             (ids (query/offending-port-22-rules-for-sg db "aws_security_group.mixed")))))))
+
+;; ---------------------------------------------------------------------------
 ;; drifted-resources - the drift Rule (issue #27)
 ;; ---------------------------------------------------------------------------
 
