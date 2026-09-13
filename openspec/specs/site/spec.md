@@ -25,7 +25,7 @@ The features section SHALL present two distinct groups — "Available now" and "
 
 #### Scenario: Available-now features are only ones with real implementation
 - **WHEN** the features section's "Available now" group is read
-- **THEN** it lists only Policy Checks and Reachability (graph search), each described using `CONTEXT.md`'s canonical glossary terms for that capability
+- **THEN** it lists Policy Checks, Reachability (graph search), Scheduled Sync, Drift detection, Unattended Terraform execution, and Auto-reconciliation, each described using `CONTEXT.md`'s canonical glossary terms for that capability
 
 #### Scenario: Roadmap features are listed separately and distinctly
 - **WHEN** the features section's "On the roadmap" group is read
