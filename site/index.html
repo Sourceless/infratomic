@@ -6,7 +6,7 @@
   <title>infratomic — the logic-powered infrastructure database</title>
   <meta
     name="description"
-    content="infratomic: the logic-powered infrastructure database. Policy-gated terraform apply and reachability graph search today, blast-radius simulation and safe deploy ordering on the roadmap."
+    content="infratomic: the logic-powered infrastructure database. Policy-gated terraform apply, reachability graph search, scheduled drift detection, unattended terraform execution, and auto-reconciliation of policy violations today, blast-radius simulation and safe deploy ordering on the roadmap."
   />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -48,6 +48,30 @@
           infrastructure answers whether one Workload can reach another (or the public internet)
           across the network graph, and whether a given Principal is IAM-reachable for an action
           across the IAM policy graph — both as structural Datalog queries, not JSON-blob scans.
+        </li>
+        <li>
+          <strong>Scheduled Sync</strong> — in addition to the on-demand CLI <code>sync</code>
+          subcommand, Sync now also runs automatically on a fixed interval (default 300s,
+          configurable), so newly-appeared unmanaged resources are ingested without a manual
+          trigger.
+        </li>
+        <li>
+          <strong>Drift detection</strong> — every Terraform-managed resource's live attributes
+          are compared against Terraform's last-asserted values, and out-of-band child additions
+          and removals are flagged on parents with foreign-key-bearing children — surfaced via
+          <code>GET /drift</code> and the CLI's <code>drift-check</code> subcommand. Detection
+          only; nothing here mutates or reverts a Drifted resource.
+        </li>
+        <li>
+          <strong>Unattended Terraform execution</strong> — <code>apply</code>, <code>import</code>,
+          and <code>destroy</code> can run unattended, each call recorded as an Invocation, with
+          per-resource-address locking to serialize concurrent runs against the same address.
+        </li>
+        <li>
+          <strong>Auto-reconciliation</strong> — on every Sync pass, every registered policy Rule
+          is evaluated directly against live state, independent of Drift, and violations are
+          remediated automatically — <code>terraform apply</code> for a drifted managed resource,
+          a synthesized import+destroy for an unmanaged one — with every decision recorded.
         </li>
       </ul>
 
